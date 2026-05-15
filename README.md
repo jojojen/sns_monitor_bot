@@ -5,6 +5,7 @@ A Python bot for monitoring X (Twitter) posts on specific accounts, keywords, an
 ## Features
 
 - **Account monitoring**: Track posts from specific X accounts
+- **Account keyword filters**: Notify only when tracked accounts post tweets containing selected words
 - **Keyword search**: Monitor X for specific keywords or topics
 - **Trend tracking**: Watch trending topics and get notified when new trends appear
 - **Human-like behavior**: Random delays between requests to avoid rate limiting
@@ -55,6 +56,12 @@ TELEGRAM_CHAT_ID=your_chat_id
 Monitor a specific X account:
 ```bash
 python -m sns_monitor add-account @username --chat-id 123 --label "My Label" --interval 15
+```
+
+Only notify when an account tweet contains any selected keyword:
+```bash
+python -m sns_monitor add-account @elonmusk --chat-id 123 --keywords buy sell
+python -m sns_monitor add-account @elonmusk --chat-id 123 --keywords '["buy", "sell"]'
 ```
 
 #### Add Keyword Watch
@@ -188,7 +195,7 @@ The account may be rate-limited. Increase check intervals or wait 15+ minutes be
 - [ ] Web UI for rule management
 - [ ] Multiple X account support with auto-rotation
 - [ ] Discord webhook notifications
-- [ ] Advanced filtering (keywords in replies, retweets only, etc.)
+- [ ] Advanced filtering (retweets only, regex filters, etc.)
 - [ ] Tweet archival and search across saved tweets
 - [ ] Integration with aka_no_claw agent system
 

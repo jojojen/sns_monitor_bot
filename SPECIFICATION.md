@@ -61,12 +61,13 @@ sns_monitor_bot 是一個監控 X (Twitter) 的自動化機器人，用於追蹤
 - `screen_name` (必須): 帳號名稱，不需要 @ 符號
 - `user_id` (可選): 數字帳號 ID，首次檢查時自動解析
 - `label` (可選): 人類可讀的標籤
+- `include_keywords` (可選): 只通知推文本文包含任一指定詞的帳號發文；空值表示通知所有新推文
 - `schedule_minutes` (可選): 檢查間隔，預設 15 分鐘
 - `chat_id`: Telegram 聊天 ID
 
 **檢查邏輯**:
 1. 首次檢查: 取得最新發文，標記所有為「已通知」(避免初始化時洪泛)
-2. 後續檢查: 取得最新發文，比較資料庫，通知新推文
+2. 後續檢查: 取得最新發文，比較資料庫，只通知通過 `include_keywords` 篩選的新推文
 3. 檢查頻率: 根據 `last_checked_at + schedule_minutes` 決定是否執行
 
 **數據流**:
@@ -243,6 +244,7 @@ class AccountWatch:
     screen_name: str            # 不含 @，首次檢查時解析為 user_id
     user_id: str | None
     label: str
+    include_keywords: tuple[str, ...] = ()
     enabled: bool = True
     schedule_minutes: int = 15
     chat_id: str = ""

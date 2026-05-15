@@ -10,6 +10,8 @@ def format_account_notification(rule: AccountWatch, tweets: list[Tweet]) -> str:
         f"追蹤帳號：@{rule.screen_name} ({rule.label})",
         f"發現 {len(tweets)} 則新推文：",
     ]
+    if rule.include_keywords:
+        lines.insert(2, f"篩選關鍵字：{', '.join(rule.include_keywords)}")
 
     for tweet in tweets[:5]:
         snippet = tweet.text[:100]

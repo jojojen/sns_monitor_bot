@@ -30,6 +30,7 @@ class AccountWatch:
     screen_name: str
     user_id: str | None
     label: str
+    include_keywords: tuple[str, ...] = ()
     enabled: bool = True
     schedule_minutes: int = 15
     chat_id: str = ""

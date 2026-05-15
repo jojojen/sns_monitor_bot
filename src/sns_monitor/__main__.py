@@ -9,6 +9,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from .filters import normalize_keyword_filters
 from .models import AccountWatch, KeywordWatch, TrendWatch
 from .storage import SnsDatabase
 
@@ -31,6 +32,13 @@ def main() -> int:
     add_account.add_argument("--label", default="")
     add_account.add_argument("--chat-id", required=True)
     add_account.add_argument("--interval", type=int, default=15)
+    add_account.add_argument(
+        "--keywords",
+        "--filters",
+        nargs="*",
+        default=None,
+        help='Only notify tweets containing any of these keywords. Accepts: buy sell, buy,sell, or \'["buy","sell"]\'.',
+    )
     add_account.add_argument("--db", default="data/sns.sqlite3")
 
     # add-keyword
@@ -79,16 +87,20 @@ def main() -> int:
 
         screen_name = args.screen_name.lstrip("@")
         rule_id = SnsDatabase._watch_rule_id("account", screen_name)
+        existing_rule = db.get_watch_rule(rule_id)
         rule = AccountWatch(
             rule_id=rule_id,
             screen_name=screen_name,
-            user_id=None,
-            label=args.label or f"@{screen_name}",
+            user_id=getattr(existing_rule, "user_id", None),
+            label=args.label or getattr(existing_rule, "label", None) or f"@{screen_name}",
+            include_keywords=normalize_keyword_filters(args.keywords),
             schedule_minutes=args.interval,
             chat_id=args.chat_id,
+            last_checked_at=getattr(existing_rule, "last_checked_at", None),
         )
         db.save_watch_rule(rule)
-        print(f"✓ Added account watch: @{screen_name} (id={rule.rule_id})")
+        suffix = f" filters={list(rule.include_keywords)}" if rule.include_keywords else ""
+        print(f"✓ Added account watch: @{screen_name}{suffix} (id={rule.rule_id})")
         return 0
 
     elif args.command == "add-keyword":
@@ -139,7 +151,8 @@ def main() -> int:
             status = "✓ ENABLED" if rule.enabled else "✗ DISABLED"
             last_check = rule.last_checked_at.isoformat() if rule.last_checked_at else "Never"
             if isinstance(rule, AccountWatch):
-                print(f"{status} | @{rule.screen_name} ({rule.label})")
+                filters = f" | filters: {', '.join(rule.include_keywords)}" if rule.include_keywords else ""
+                print(f"{status} | @{rule.screen_name} ({rule.label}){filters}")
             elif isinstance(rule, KeywordWatch):
                 print(f"{status} | Keyword: {rule.query} ({rule.label})")
             elif isinstance(rule, TrendWatch):

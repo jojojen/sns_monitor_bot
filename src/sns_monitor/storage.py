@@ -8,6 +8,7 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Iterator
 
+from .filters import normalize_keyword_filters
 from .models import (
     AccountWatch,
     KeywordWatch,
@@ -80,12 +81,22 @@ class SnsDatabase:
             now = utc_now().isoformat()
             kind = self._rule_kind(rule)
             query_json = self._rule_to_json(rule)
+            existing = conn.execute(
+                "SELECT created_at, last_checked_at FROM watch_rules WHERE rule_id = ?",
+                (rule.rule_id,),
+            ).fetchone()
+            created_at = existing["created_at"] if existing else now
+            last_checked_at = (
+                rule.last_checked_at.isoformat()
+                if getattr(rule, "last_checked_at", None)
+                else (existing["last_checked_at"] if existing else None)
+            )
 
             conn.execute(
                 """
                 INSERT OR REPLACE INTO watch_rules
-                (rule_id, kind, label, query_json, enabled, schedule_minutes, chat_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (rule_id, kind, label, query_json, enabled, schedule_minutes, chat_id, last_checked_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     rule.rule_id,
@@ -95,7 +106,8 @@ class SnsDatabase:
                     1 if rule.enabled else 0,
                     rule.schedule_minutes,
                     rule.chat_id,
-                    rule.last_checked_at.isoformat() if hasattr(rule, "last_checked_at") and rule.last_checked_at else now,
+                    last_checked_at,
+                    created_at,
                     now,
                 ),
             )
@@ -152,6 +164,7 @@ class SnsDatabase:
                 screen_name=rule.screen_name,
                 user_id=user_id,
                 label=rule.label,
+                include_keywords=rule.include_keywords,
                 enabled=rule.enabled,
                 schedule_minutes=rule.schedule_minutes,
                 chat_id=rule.chat_id,
@@ -280,6 +293,7 @@ class SnsDatabase:
                 {
                     "screen_name": rule.screen_name,
                     "user_id": rule.user_id,
+                    "include_keywords": list(rule.include_keywords),
                 }
             )
         elif isinstance(rule, KeywordWatch):
@@ -310,6 +324,7 @@ class SnsDatabase:
                 screen_name=query["screen_name"],
                 user_id=query.get("user_id"),
                 label=row["label"],
+                include_keywords=normalize_keyword_filters(query.get("include_keywords")),
                 enabled=bool(row["enabled"]),
                 schedule_minutes=row["schedule_minutes"],
                 chat_id=row["chat_id"],

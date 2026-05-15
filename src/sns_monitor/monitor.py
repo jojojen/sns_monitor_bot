@@ -7,6 +7,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Callable
 
+from .filters import filter_tweets_by_keywords
 from .formatters import format_account_notification, format_keyword_notification, format_trend_notification
 from .models import AccountWatch, KeywordWatch, TrendSnapshot, TrendWatch, utc_now
 from .storage import SnsDatabase
@@ -146,6 +147,7 @@ class SnsMonitor:
                 screen_name=rule.screen_name,
                 user_id=user_id,
                 label=rule.label,
+                include_keywords=rule.include_keywords,
                 enabled=rule.enabled,
                 schedule_minutes=rule.schedule_minutes,
                 chat_id=rule.chat_id,
@@ -160,10 +162,14 @@ class SnsMonitor:
         if is_first or not new_tweets:
             return
 
-        text = format_account_notification(rule, new_tweets)
+        matching_tweets = filter_tweets_by_keywords(new_tweets, rule.include_keywords)
+        if not matching_tweets:
+            return
+
+        text = format_account_notification(rule, matching_tweets)
         try:
             self._notify_fn(rule.chat_id, text)
-            self._db.mark_tweets_notified(rule.rule_id, [t.tweet_id for t in new_tweets])
+            self._db.mark_tweets_notified(rule.rule_id, [t.tweet_id for t in matching_tweets])
         except Exception:
             logger.exception("Notification failed for rule_id=%s", rule.rule_id)
 
