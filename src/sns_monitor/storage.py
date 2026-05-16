@@ -153,6 +153,15 @@ class SnsDatabase:
                 return None
             return self._row_to_rule(dict(row))
 
+    def list_watch_rules_missing_domains(self, *, limit: int | None = None) -> list[WatchRule]:
+        """List enabled watch rules that have no domain tags yet (used by the
+        opportunity agent's one-rule-per-tick LLM backfill).
+        """
+        rules = [rule for rule in self.list_watch_rules() if rule.enabled and not rule.domains]
+        if limit is not None:
+            rules = rules[:limit]
+        return rules
+
     def update_user_id(self, rule_id: str, user_id: str) -> None:
         with self.connect() as conn:
             rule = self.get_watch_rule(rule_id)
@@ -165,6 +174,7 @@ class SnsDatabase:
                 user_id=user_id,
                 label=rule.label,
                 include_keywords=rule.include_keywords,
+                domains=rule.domains,
                 enabled=rule.enabled,
                 schedule_minutes=rule.schedule_minutes,
                 chat_id=rule.chat_id,
@@ -294,29 +304,36 @@ class SnsDatabase:
                     "screen_name": rule.screen_name,
                     "user_id": rule.user_id,
                     "include_keywords": list(rule.include_keywords),
+                    "domains": list(rule.domains),
                 }
             )
         elif isinstance(rule, KeywordWatch):
             return json.dumps(
                 {
                     "query": rule.query,
+                    "domains": list(rule.domains),
                 }
             )
         elif isinstance(rule, TrendWatch):
             return json.dumps(
                 {
                     "category": rule.category,
+                    "domains": list(rule.domains),
                 }
             )
         raise ValueError(f"Unknown rule type: {type(rule)}")
 
     @staticmethod
     def _row_to_rule(row: dict) -> WatchRule | None:
+        from .models import normalize_domains
+
         kind = row["kind"]
         query = json.loads(row["query_json"])
         last_checked = None
         if row["last_checked_at"]:
             last_checked = datetime.fromisoformat(row["last_checked_at"])
+
+        domains = normalize_domains(query.get("domains"))
 
         if kind == "account":
             return AccountWatch(
@@ -325,6 +342,7 @@ class SnsDatabase:
                 user_id=query.get("user_id"),
                 label=row["label"],
                 include_keywords=normalize_keyword_filters(query.get("include_keywords")),
+                domains=domains,
                 enabled=bool(row["enabled"]),
                 schedule_minutes=row["schedule_minutes"],
                 chat_id=row["chat_id"],
@@ -335,6 +353,7 @@ class SnsDatabase:
                 rule_id=row["rule_id"],
                 query=query["query"],
                 label=row["label"],
+                domains=domains,
                 enabled=bool(row["enabled"]),
                 schedule_minutes=row["schedule_minutes"],
                 chat_id=row["chat_id"],
@@ -345,6 +364,7 @@ class SnsDatabase:
                 rule_id=row["rule_id"],
                 category=query["category"],
                 label=row["label"],
+                domains=domains,
                 enabled=bool(row["enabled"]),
                 schedule_minutes=row["schedule_minutes"],
                 chat_id=row["chat_id"],

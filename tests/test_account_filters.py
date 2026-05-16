@@ -60,17 +60,48 @@ def test_parse_keyword_filter_text_supports_shell_style_quotes() -> None:
 
 
 def test_parse_account_watch_text_extracts_handle_and_filters() -> None:
-    assert parse_account_watch_text('@elonmusk ["buy", "sell"]') == ("elonmusk", ("buy", "sell"))
+    # Legacy JSON-array filter form continues to work; no `domain[...]` so
+    # the third tuple entry is None (caller preserves existing rule domain).
+    assert parse_account_watch_text('@elonmusk ["buy", "sell"]') == (
+        "elonmusk",
+        ("buy", "sell"),
+        None,
+    )
 
 
 def test_parse_account_watch_text_accepts_full_width_filter_brackets() -> None:
-    assert parse_account_watch_text("@tenbai_hakase ［抽選］ 篩選") == ("tenbai_hakase", ("抽選",))
+    assert parse_account_watch_text("@tenbai_hakase ［抽選］ 篩選") == (
+        "tenbai_hakase",
+        ("抽選",),
+        None,
+    )
 
 
 def test_parse_account_watch_text_includes_real_donald_trump_buy_sell_filter() -> None:
     assert parse_account_watch_text('@realDonaldTrump ["buy", "sell"]') == (
         "realDonaldTrump",
         ("buy", "sell"),
+        None,
+    )
+
+
+def test_parse_account_watch_text_extracts_labeled_filter_and_domain_brackets() -> None:
+    # New syntax: explicit filter[...] and domain[...] labels.
+    assert parse_account_watch_text("@Laurier_News filter[抽選] domain[pokemon, yugioh]") == (
+        "Laurier_News",
+        ("抽選",),
+        ("pokemon", "yugioh"),
+    )
+
+
+def test_parse_account_watch_text_domain_only_preserves_legacy_filter() -> None:
+    # Domain provided but no filter[...] → caller can preserve existing
+    # filter (we signal that by returning empty tuple for filter and the
+    # parsed domain tuple).
+    assert parse_account_watch_text("@elonmusk domain[stock, politic]") == (
+        "elonmusk",
+        (),
+        ("stock", "politic"),
     )
 
 
