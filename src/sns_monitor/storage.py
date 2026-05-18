@@ -50,7 +50,8 @@ class SnsDatabase:
                     chat_id      TEXT NOT NULL,
                     last_checked_at TEXT,
                     created_at   TEXT NOT NULL,
-                    updated_at   TEXT NOT NULL
+                    updated_at   TEXT NOT NULL,
+                    source       TEXT NOT NULL DEFAULT 'x'
                 );
 
                 CREATE TABLE IF NOT EXISTS seen_tweets (
@@ -74,6 +75,10 @@ class SnsDatabase:
                 );
                 """
             )
+            # Idempotent ALTER TABLE for older DBs that pre-date `source`.
+            existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(watch_rules)")}
+            if "source" not in existing_cols:
+                conn.execute("ALTER TABLE watch_rules ADD COLUMN source TEXT NOT NULL DEFAULT 'x'")
             conn.commit()
 
     def save_watch_rule(self, rule: WatchRule) -> None:
@@ -95,8 +100,8 @@ class SnsDatabase:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO watch_rules
-                (rule_id, kind, label, query_json, enabled, schedule_minutes, chat_id, last_checked_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (rule_id, kind, label, query_json, enabled, schedule_minutes, chat_id, last_checked_at, created_at, updated_at, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     rule.rule_id,
@@ -109,6 +114,7 @@ class SnsDatabase:
                     last_checked_at,
                     created_at,
                     now,
+                    getattr(rule, "source", "x"),
                 ),
             )
             conn.commit()
@@ -163,24 +169,14 @@ class SnsDatabase:
         return rules
 
     def update_user_id(self, rule_id: str, user_id: str) -> None:
+        from dataclasses import replace
+
         with self.connect() as conn:
             rule = self.get_watch_rule(rule_id)
             if not isinstance(rule, AccountWatch):
                 return
 
-            updated_rule = AccountWatch(
-                rule_id=rule.rule_id,
-                screen_name=rule.screen_name,
-                user_id=user_id,
-                label=rule.label,
-                include_keywords=rule.include_keywords,
-                domains=rule.domains,
-                enabled=rule.enabled,
-                schedule_minutes=rule.schedule_minutes,
-                chat_id=rule.chat_id,
-                last_checked_at=rule.last_checked_at,
-            )
-            self.save_watch_rule(updated_rule)
+            self.save_watch_rule(replace(rule, user_id=user_id))
 
     def mark_rule_checked(self, rule_id: str) -> None:
         with self.connect() as conn:
@@ -275,10 +271,19 @@ class SnsDatabase:
             )
 
     @staticmethod
-    def _watch_rule_id(kind: str, key: str) -> str:
-        """Generate deterministic rule ID from kind and key."""
-        h = sha1(f"{kind}|{key}".encode()).hexdigest()
-        return f"{kind}_{h[:12]}"
+    def _watch_rule_id(kind: str, key: str, source: str = "x") -> str:
+        """Generate deterministic rule ID from kind and key.
+
+        source="x" preserves the legacy hash format so existing rule IDs in
+        the DB remain stable across this migration. Other sources prepend
+        the source name to both the hash payload and the visible prefix so
+        e.g. `keyword:Umbreon` doesn't collide between X and Reddit.
+        """
+        if source == "x":
+            h = sha1(f"{kind}|{key}".encode()).hexdigest()
+            return f"{kind}_{h[:12]}"
+        h = sha1(f"{source}|{kind}|{key}".encode()).hexdigest()
+        return f"{source}_{kind}_{h[:12]}"
 
     @staticmethod
     def _snapshot_id(rule_id: str, captured_at_iso: str) -> str:
@@ -334,6 +339,7 @@ class SnsDatabase:
             last_checked = datetime.fromisoformat(row["last_checked_at"])
 
         domains = normalize_domains(query.get("domains"))
+        source = row["source"] if "source" in row.keys() and row["source"] else "x"
 
         if kind == "account":
             return AccountWatch(
@@ -347,6 +353,7 @@ class SnsDatabase:
                 schedule_minutes=row["schedule_minutes"],
                 chat_id=row["chat_id"],
                 last_checked_at=last_checked,
+                source=source,
             )
         elif kind == "keyword":
             return KeywordWatch(
@@ -358,6 +365,7 @@ class SnsDatabase:
                 schedule_minutes=row["schedule_minutes"],
                 chat_id=row["chat_id"],
                 last_checked_at=last_checked,
+                source=source,
             )
         elif kind == "trend":
             return TrendWatch(
@@ -369,5 +377,6 @@ class SnsDatabase:
                 schedule_minutes=row["schedule_minutes"],
                 chat_id=row["chat_id"],
                 last_checked_at=last_checked,
+                source=source,
             )
         return None

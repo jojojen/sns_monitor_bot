@@ -79,6 +79,7 @@ class AccountWatch:
     schedule_minutes: int = 15
     chat_id: str = ""
     last_checked_at: datetime | None = None
+    source: str = "x"
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,7 @@ class KeywordWatch:
     schedule_minutes: int = 30
     chat_id: str = ""
     last_checked_at: datetime | None = None
+    source: str = "x"
 
 
 @dataclass(frozen=True)
@@ -103,6 +105,7 @@ class TrendWatch:
     schedule_minutes: int = 60
     chat_id: str = ""
     last_checked_at: datetime | None = None
+    source: str = "x"
 
 
 WatchRule = Union[AccountWatch, KeywordWatch, TrendWatch]

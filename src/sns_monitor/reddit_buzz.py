@@ -126,6 +126,34 @@ def _parse_reddit_post(pd: dict) -> Optional[Tweet]:
     )
 
 
+def _reddit_subreddit_hot_sync(name: str, count: int) -> list[Tweet]:
+    """Blocking fetch of /r/<name>/hot.json. Returns up to count posts as Tweet."""
+    cleaned = name.strip().lstrip("/").removeprefix("r/").strip("/")
+    if not cleaned:
+        return []
+    limit = min(50, max(5, count))
+    url = f"https://www.reddit.com/r/{urllib.parse.quote(cleaned, safe='')}/hot.json?limit={limit}&raw_json=1"
+    body = _curl_get(url)
+    if body is None:
+        return []
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return []
+    children = (data.get("data") or {}).get("children") or []
+    posts: list[Tweet] = []
+    for c in children:
+        pd = c.get("data") or {}
+        if pd.get("stickied"):
+            # Skip pinned mod posts — they are usually rules/megathreads
+            # and would dominate every poll with no new signal.
+            continue
+        post = _parse_reddit_post(pd)
+        if post is not None:
+            posts.append(post)
+    return posts
+
+
 class RedditBuzzClient:
     """Async wrapper around the Reddit search JSON API."""
 
@@ -140,4 +168,13 @@ class RedditBuzzClient:
             query,
             count,
             window or self._default_window,
+        )
+
+    async def fetch_subreddit_hot(self, name: str, *, count: int = 25) -> list[Tweet]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            _reddit_subreddit_hot_sync,
+            name,
+            count,
         )

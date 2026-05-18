@@ -10,6 +10,7 @@ from typing import Callable
 from .filters import filter_tweets_by_keywords
 from .formatters import format_account_notification, format_keyword_notification, format_trend_notification
 from .models import AccountWatch, KeywordWatch, TrendSnapshot, TrendWatch, utc_now
+from .sources import SnsSource, build_default_sources
 from .storage import SnsDatabase
 from .x_client import XClient
 
@@ -17,18 +18,31 @@ logger = logging.getLogger(__name__)
 
 
 class SnsMonitor:
-    """Background X monitoring daemon with asyncio loop in a thread."""
+    """Background SNS monitoring daemon with asyncio loop in a thread.
+
+    Each watch rule carries a `source` field (e.g. "x", "reddit"); the
+    monitor dispatches fetches via the `sources` registry instead of a
+    single hardcoded backend.
+    """
 
     def __init__(
         self,
         *,
         db_path: str | Path,
-        x_client: XClient,
         notify_fn: Callable[[str, str], None],
         interval_seconds: int = 60,
+        sources: dict[str, SnsSource] | None = None,
+        x_client: XClient | None = None,
     ) -> None:
+        if sources is None:
+            sources = build_default_sources(x_client=x_client)
+        if "x" not in sources and x_client is not None:
+            from .sources import XSource
+
+            sources = {**sources, "x": XSource(x_client)}
         self._db = SnsDatabase(db_path)
-        self._x = x_client
+        self._sources = sources
+        self._x = x_client  # retained only for ensure_logged_in fallback paths
         self._notify_fn = notify_fn
         self._interval = interval_seconds
         self._stop = threading.Event()
@@ -68,23 +82,24 @@ class SnsMonitor:
 
     async def _async_loop(self) -> None:
         """Main async monitoring loop with auto-retry."""
-        # Try to login with retry
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                logger.info("Login attempt %d/%d...", attempt + 1, max_retries)
-                await self._x.ensure_logged_in()
-                logger.info("✅ Successfully logged in to X")
-                break
-            except Exception as e:
-                logger.warning("❌ Login attempt %d failed: %s", attempt + 1, e)
-                if attempt < max_retries - 1:
-                    wait_time = 5 * (attempt + 1)  # 5s, 10s, 15s
-                    logger.info("⏳ Retrying in %d seconds...", wait_time)
-                    await asyncio.sleep(wait_time)
-                else:
-                    logger.error("❌ All login attempts failed after %d tries", max_retries)
-                    raise
+        x_source = self._sources.get("x")
+        if x_source is not None:
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    logger.info("Login attempt %d/%d...", attempt + 1, max_retries)
+                    await x_source.ensure_logged_in()
+                    logger.info("✅ Successfully logged in to X")
+                    break
+                except Exception as e:
+                    logger.warning("❌ Login attempt %d failed: %s", attempt + 1, e)
+                    if attempt < max_retries - 1:
+                        wait_time = 5 * (attempt + 1)
+                        logger.info("⏳ Retrying in %d seconds...", wait_time)
+                        await asyncio.sleep(wait_time)
+                    else:
+                        logger.error("❌ All login attempts failed after %d tries", max_retries)
+                        raise
 
         # Run tick loop
         await self._async_tick()
@@ -133,29 +148,35 @@ class SnsMonitor:
         elif isinstance(rule, TrendWatch):
             await self._check_trend_watch(rule)
 
+    def _source_for(self, rule) -> SnsSource | None:
+        source = self._sources.get(getattr(rule, "source", "x"))
+        if source is None:
+            logger.warning(
+                "No source plugin registered for rule_id=%s source=%s — skipping",
+                rule.rule_id,
+                getattr(rule, "source", "x"),
+            )
+        return source
+
     async def _check_account_watch(self, rule: AccountWatch) -> None:
-        """Check a single account watch rule."""
+        """Check a single account watch rule via its source plugin."""
+        from dataclasses import replace
+
+        source = self._source_for(rule)
+        if source is None:
+            return
+
         user_id = rule.user_id
         if user_id is None:
-            user_id = await self._x.resolve_user_id(rule.screen_name)
+            user_id = await source.resolve_user_id(rule.screen_name)
             if not user_id:
-                logger.warning("Could not resolve user ID for @%s", rule.screen_name)
+                logger.warning("Could not resolve user ID for source=%s target=%s", rule.source, rule.screen_name)
                 return
             self._db.update_user_id(rule.rule_id, user_id)
-            rule = AccountWatch(
-                rule_id=rule.rule_id,
-                screen_name=rule.screen_name,
-                user_id=user_id,
-                label=rule.label,
-                include_keywords=rule.include_keywords,
-                enabled=rule.enabled,
-                schedule_minutes=rule.schedule_minutes,
-                chat_id=rule.chat_id,
-                last_checked_at=rule.last_checked_at,
-            )
+            rule = replace(rule, user_id=user_id)
 
         is_first = rule.last_checked_at is None
-        tweets = await self._x.get_timeline(user_id)
+        tweets = await source.fetch_account(rule.screen_name, user_id=user_id)
         new_tweets = self._db.record_tweets(rule.rule_id, tweets)
         self._db.mark_rule_checked(rule.rule_id)
 
@@ -174,9 +195,13 @@ class SnsMonitor:
             logger.exception("Notification failed for rule_id=%s", rule.rule_id)
 
     async def _check_keyword_watch(self, rule: KeywordWatch) -> None:
-        """Check a keyword watch rule."""
+        """Check a keyword watch rule via its source plugin."""
+        source = self._source_for(rule)
+        if source is None:
+            return
+
         is_first = rule.last_checked_at is None
-        tweets = await self._x.search(rule.query)
+        tweets = await source.search_keyword(rule.query)
         new_tweets = self._db.record_tweets(rule.rule_id, tweets)
         self._db.mark_rule_checked(rule.rule_id)
 
@@ -191,8 +216,20 @@ class SnsMonitor:
             logger.exception("Notification failed for rule_id=%s", rule.rule_id)
 
     async def _check_trend_watch(self, rule: TrendWatch) -> None:
-        """Check a trend watch rule."""
-        trend_names = await self._x.get_trends(rule.category)
+        """Check a trend watch rule via its source plugin."""
+        source = self._source_for(rule)
+        if source is None:
+            return
+        try:
+            trend_names = await source.fetch_trend(rule.category)
+        except NotImplementedError:
+            logger.warning(
+                "Trend watches not supported by source=%s — disabling rule_id=%s",
+                rule.source,
+                rule.rule_id,
+            )
+            self._db.mark_rule_checked(rule.rule_id)
+            return
         if not trend_names:
             self._db.mark_rule_checked(rule.rule_id)
             return
@@ -226,9 +263,10 @@ _monitor: SnsMonitor | None = None
 def ensure_monitor(
     *,
     db_path: str | Path,
-    x_client: XClient,
     notify_fn: Callable[[str, str], None],
     interval_seconds: int = 60,
+    x_client: XClient | None = None,
+    sources: dict[str, SnsSource] | None = None,
 ) -> tuple[SnsMonitor, bool]:
     """Get or create the singleton monitor. Returns (monitor, is_new)."""
     global _monitor
@@ -238,6 +276,7 @@ def ensure_monitor(
         _monitor = SnsMonitor(
             db_path=db_path,
             x_client=x_client,
+            sources=sources,
             notify_fn=notify_fn,
             interval_seconds=interval_seconds,
         )

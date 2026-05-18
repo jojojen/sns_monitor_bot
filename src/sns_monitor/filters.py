@@ -9,6 +9,11 @@ from collections.abc import Iterable
 from .models import Tweet
 
 _ACCOUNT_HANDLE_RE = re.compile(r"^@(?P<handle>[A-Za-z0-9_]{1,15})(?:\s+(?P<filters>.*))?$")
+_SUBREDDIT_HANDLE_RE = re.compile(
+    r"^/?r/(?P<handle>[A-Za-z0-9_]{2,21})(?:\s+(?P<filters>.*))?$", re.IGNORECASE
+)
+_SCHEDULE_TOKEN_RE = re.compile(r"(?<!\w)schedule\s*[:=]\s*(\d{1,4})\b", re.IGNORECASE)
+_KNOWN_SOURCES: tuple[str, ...] = ("reddit", "x")
 _FILTER_PREFIX_RE = re.compile(r"^(?:--)?(?:include-)?(?:keywords?|filters?)\s*[:=]?\s*", re.IGNORECASE)
 _BRACKETED_FILTER_RE = re.compile(r"[\[\(]([^\]\)]+)[\]\)]")
 # Captures `filter[...]` / `domain[...]` labelled brackets (case-insensitive,
@@ -137,14 +142,17 @@ def extract_labeled_brackets(raw: str) -> tuple[tuple[str, ...] | None, tuple[st
 def parse_account_watch_text(
     raw: str,
 ) -> tuple[str, tuple[str, ...], tuple[str, ...] | None] | None:
-    """Parse '@handle [optional filter[...]/domain[...] or legacy ["a","b"]]'.
+    """Parse '@handle' (X) OR 'r/sub' (Reddit) optionally followed by
+    filter[...]/domain[...]/legacy ["a","b"] keywords.
 
     Returns ``(handle, include_keywords, domains)`` where ``domains`` is
     ``None`` if the user did NOT supply a ``domain[...]`` bracket (caller
-    should preserve the existing rule's domains in that case).
+    should preserve the existing rule's domains in that case). The returned
+    handle is bare — caller decides whether to render it as `@x` or `r/x`
+    based on the source field.
     """
     explicit_filter, domains, remainder = extract_labeled_brackets(raw.strip())
-    match = _ACCOUNT_HANDLE_RE.match(remainder)
+    match = _ACCOUNT_HANDLE_RE.match(remainder) or _SUBREDDIT_HANDLE_RE.match(remainder)
     if match is None:
         return None
     handle = match.group("handle")
@@ -153,6 +161,47 @@ def parse_account_watch_text(
     else:
         include_keywords = parse_keyword_filter_text(match.group("filters"))
     return handle, include_keywords, domains
+
+
+def split_source_prefix(raw: str) -> tuple[str, str]:
+    """Strip a known `<source>:` prefix from raw input.
+
+    Returns ``(source, remainder)``. Falls back to ``("x", raw)`` for
+    backwards compatibility when no known prefix is present — old commands
+    like ``/snsadd @elonmusk`` or ``/snsadd keyword:foo`` continue to work
+    as X-source watches.
+    """
+    cleaned = raw.strip()
+    lowered = cleaned.lower()
+    for src in _KNOWN_SOURCES:
+        prefix = f"{src}:"
+        if lowered.startswith(prefix):
+            return src, cleaned[len(prefix):].strip()
+    return "x", raw
+
+
+def extract_schedule_minutes(raw: str) -> tuple[int | None, str]:
+    """Pull a ``schedule:NN`` token out of *raw* and return (NN, cleaned_raw).
+
+    NN is clamped to ``[5, 1440]`` — values out of range are dropped (returned
+    as ``None``) but the token is still stripped from the remainder so it
+    doesn't leak into downstream parsers.
+    """
+    if not raw:
+        return None, raw
+    standardized = _standardize_filter_text(raw)
+    match = _SCHEDULE_TOKEN_RE.search(standardized)
+    if match is None:
+        return None, raw
+    try:
+        value = int(match.group(1))
+    except ValueError:
+        return None, raw
+    cleaned = (standardized[: match.start()] + " " + standardized[match.end():]).strip()
+    cleaned = " ".join(cleaned.split())
+    if 5 <= value <= 1440:
+        return value, cleaned
+    return None, cleaned
 
 
 def tweet_matches_keyword_filters(tweet: Tweet, include_keywords: tuple[str, ...]) -> bool:
