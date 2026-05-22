@@ -100,3 +100,59 @@ def apply_bulk_keyword_filter_add(
         sns_db.save_watch_rule(new_rule)
         updated.append(new_rule)
     return updated
+
+
+def apply_bulk_keyword_filter_remove(
+    sns_db: SnsDatabase,
+    accounts: list[AccountWatch],
+    keywords_to_remove: Iterable[str],
+) -> list[AccountWatch]:
+    """Remove specific ``keywords_to_remove`` from each account's
+    ``include_keywords`` and persist.
+
+    Case-fold compare so the user doesn't need to match casing exactly. Rules
+    where none of the supplied keywords are present are skipped (no save, not
+    returned in the updated list). Returns the list of rules that actually
+    changed, in their *new* form.
+    """
+    drop_set = {kw.casefold() for kw in keywords_to_remove if kw}
+    if not drop_set:
+        return []
+    updated: list[AccountWatch] = []
+    for rule in accounts:
+        survivors = tuple(
+            kw for kw in rule.include_keywords if kw.casefold() not in drop_set
+        )
+        if survivors == rule.include_keywords:
+            continue  # none of the listed keywords were present — skip
+        new_rule = replace(rule, include_keywords=survivors)
+        sns_db.save_watch_rule(new_rule)
+        updated.append(new_rule)
+    return updated
+
+
+SCHEDULE_MIN_MINUTES: int = 5
+SCHEDULE_MAX_MINUTES: int = 1440
+
+
+def apply_bulk_schedule_update(
+    sns_db: SnsDatabase,
+    accounts: list[AccountWatch],
+    new_minutes: int,
+) -> list[AccountWatch]:
+    """Set ``schedule_minutes=new_minutes`` on each account and persist.
+
+    ``new_minutes`` is clamped to ``[SCHEDULE_MIN_MINUTES, SCHEDULE_MAX_MINUTES]``
+    so a stray "0" or "9999" can't break the poller. Accounts already at the
+    target value are skipped. Returns the list of rules that actually changed,
+    in their *new* form.
+    """
+    clamped = max(SCHEDULE_MIN_MINUTES, min(SCHEDULE_MAX_MINUTES, int(new_minutes)))
+    updated: list[AccountWatch] = []
+    for rule in accounts:
+        if rule.schedule_minutes == clamped:
+            continue  # already at target — skip
+        new_rule = replace(rule, schedule_minutes=clamped)
+        sns_db.save_watch_rule(new_rule)
+        updated.append(new_rule)
+    return updated

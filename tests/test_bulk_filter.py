@@ -3,7 +3,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sns_monitor.bulk_filter import (
+    SCHEDULE_MAX_MINUTES,
+    SCHEDULE_MIN_MINUTES,
     apply_bulk_keyword_filter_add,
+    apply_bulk_keyword_filter_remove,
+    apply_bulk_schedule_update,
     find_accounts_matching_domain,
     merge_keywords_dedupe,
     resolve_target_domain_set,
@@ -131,3 +135,103 @@ def test_apply_bulk_preserves_other_fields(tmp_path) -> None:
     assert refreshed.screen_name == "acc1"
     assert refreshed.chat_id == "0"
     assert refreshed.schedule_minutes == 15
+
+
+# ── apply_bulk_keyword_filter_remove ─────────────────────────────────────────
+
+
+def test_apply_bulk_remove_drops_specific_keyword_only(tmp_path) -> None:
+    db = SnsDatabase(tmp_path / "sns.sqlite3")
+    db.bootstrap()
+    rule = _account("acc1", domains=("tcg",), keywords=("720分鐘", "抽選", "新弾"))
+    db.save_watch_rule(rule)
+
+    updated = apply_bulk_keyword_filter_remove(db, [rule], ["720分鐘"])
+
+    assert len(updated) == 1
+    assert updated[0].include_keywords == ("抽選", "新弾")
+    refreshed = db.get_watch_rule(rule.rule_id)
+    assert refreshed.include_keywords == ("抽選", "新弾")
+
+
+def test_apply_bulk_remove_skips_accounts_where_keyword_absent(tmp_path) -> None:
+    db = SnsDatabase(tmp_path / "sns.sqlite3")
+    db.bootstrap()
+    rule_has = _account("has", domains=("tcg",), keywords=("720分鐘", "新弾"))
+    rule_no = _account("no", domains=("tcg",), keywords=("抽選",))
+    db.save_watch_rule(rule_has)
+    db.save_watch_rule(rule_no)
+
+    updated = apply_bulk_keyword_filter_remove(db, [rule_has, rule_no], ["720分鐘"])
+
+    assert {r.screen_name for r in updated} == {"has"}
+    refreshed_no = db.get_watch_rule(rule_no.rule_id)
+    assert refreshed_no.include_keywords == ("抽選",)
+
+
+def test_apply_bulk_remove_is_casefold(tmp_path) -> None:
+    db = SnsDatabase(tmp_path / "sns.sqlite3")
+    db.bootstrap()
+    rule = _account("acc", domains=("tcg",), keywords=("Restock", "Other"))
+    db.save_watch_rule(rule)
+
+    updated = apply_bulk_keyword_filter_remove(db, [rule], ["RESTOCK"])
+
+    assert updated[0].include_keywords == ("Other",)
+
+
+def test_apply_bulk_remove_empty_keywords_is_noop(tmp_path) -> None:
+    db = SnsDatabase(tmp_path / "sns.sqlite3")
+    db.bootstrap()
+    rule = _account("acc", domains=("tcg",), keywords=("a",))
+    db.save_watch_rule(rule)
+
+    assert apply_bulk_keyword_filter_remove(db, [rule], []) == []
+    assert db.get_watch_rule(rule.rule_id).include_keywords == ("a",)
+
+
+# ── apply_bulk_schedule_update ───────────────────────────────────────────────
+
+
+def test_apply_bulk_schedule_update_changes_minutes(tmp_path) -> None:
+    db = SnsDatabase(tmp_path / "sns.sqlite3")
+    db.bootstrap()
+    rule = _account("acc1", domains=("tcg",))
+    db.save_watch_rule(rule)
+
+    updated = apply_bulk_schedule_update(db, [rule], 720)
+
+    assert len(updated) == 1
+    assert updated[0].schedule_minutes == 720
+    assert db.get_watch_rule(rule.rule_id).schedule_minutes == 720
+
+
+def test_apply_bulk_schedule_update_clamps_to_valid_range(tmp_path) -> None:
+    db = SnsDatabase(tmp_path / "sns.sqlite3")
+    db.bootstrap()
+    rule = _account("acc", domains=("tcg",))
+    db.save_watch_rule(rule)
+
+    apply_bulk_schedule_update(db, [rule], 99999)
+    assert db.get_watch_rule(rule.rule_id).schedule_minutes == SCHEDULE_MAX_MINUTES
+
+    apply_bulk_schedule_update(db, [db.get_watch_rule(rule.rule_id)], 0)
+    assert db.get_watch_rule(rule.rule_id).schedule_minutes == SCHEDULE_MIN_MINUTES
+
+
+def test_apply_bulk_schedule_skips_accounts_already_at_target_value(tmp_path) -> None:
+    db = SnsDatabase(tmp_path / "sns.sqlite3")
+    db.bootstrap()
+    rule_at = _account("at", domains=("tcg",))
+    rule_different = _account("diff", domains=("tcg",))
+    db.save_watch_rule(rule_at)
+    db.save_watch_rule(rule_different)
+    # Set "at" to 720 first
+    apply_bulk_schedule_update(db, [rule_at], 720)
+    refreshed_at = db.get_watch_rule(rule_at.rule_id)
+
+    # Now ask for 720 on both — only "diff" should change
+    updated = apply_bulk_schedule_update(
+        db, [refreshed_at, rule_different], 720
+    )
+    assert {r.screen_name for r in updated} == {"diff"}
