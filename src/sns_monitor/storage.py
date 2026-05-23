@@ -73,12 +73,30 @@ class SnsDatabase:
                     captured_at  TEXT NOT NULL,
                     FOREIGN KEY (rule_id) REFERENCES watch_rules(rule_id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS sns_post_feedback (
+                    feedback_id   TEXT PRIMARY KEY,
+                    tweet_id      TEXT NOT NULL,
+                    rule_id       TEXT NOT NULL,
+                    chat_id       TEXT NOT NULL,
+                    feedback_kind TEXT NOT NULL,
+                    feedback_at   TEXT NOT NULL,
+                    FOREIGN KEY (rule_id) REFERENCES watch_rules(rule_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_sns_post_feedback_rule
+                    ON sns_post_feedback(rule_id);
+                CREATE INDEX IF NOT EXISTS idx_sns_post_feedback_tweet
+                    ON sns_post_feedback(tweet_id);
+                CREATE INDEX IF NOT EXISTS idx_sns_post_feedback_rule_kind_at
+                    ON sns_post_feedback(rule_id, feedback_kind, feedback_at);
                 """
             )
-            # Idempotent ALTER TABLE for older DBs that pre-date `source`.
+            # Idempotent ALTER TABLE for older DBs.
             existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(watch_rules)")}
             if "source" not in existing_cols:
                 conn.execute("ALTER TABLE watch_rules ADD COLUMN source TEXT NOT NULL DEFAULT 'x'")
+            if "cooldown_until" not in existing_cols:
+                conn.execute("ALTER TABLE watch_rules ADD COLUMN cooldown_until TEXT")
             conn.commit()
 
     def save_watch_rule(self, rule: WatchRule) -> None:
@@ -186,6 +204,89 @@ class SnsDatabase:
                 (now, now, rule_id),
             )
             conn.commit()
+
+    # ── SNS post feedback CRUD ──────────────────────────────────────────────
+
+    def record_sns_post_feedback(
+        self,
+        *,
+        tweet_id: str,
+        rule_id: str,
+        chat_id: str,
+        feedback_kind: str,
+    ) -> str:
+        """Insert a feedback row. Returns the generated feedback_id.
+
+        The feedback_id is hashed from (tweet_id, rule_id, feedback_at) so
+        repeated taps on the same (tweet, rule) get distinct rows — we need
+        time-series counting (for the 3-strike auto-disable rule), not
+        last-write-wins.
+        """
+        now = utc_now().isoformat()
+        feedback_id = sha1(
+            f"{tweet_id}|{rule_id}|{now}|{feedback_kind}".encode("utf-8")
+        ).hexdigest()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO sns_post_feedback
+                    (feedback_id, tweet_id, rule_id, chat_id, feedback_kind, feedback_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (feedback_id, tweet_id, rule_id, chat_id, feedback_kind, now),
+            )
+            conn.commit()
+        return feedback_id
+
+    def count_recent_post_feedback(
+        self, *, rule_id: str, feedback_kind: str, since_iso: str,
+    ) -> int:
+        """Count feedback rows for this rule with the given kind and
+        feedback_at >= since_iso. Powers the 3-strike auto-disable rule."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM sns_post_feedback "
+                "WHERE rule_id = ? AND feedback_kind = ? AND feedback_at >= ?",
+                (rule_id, feedback_kind, since_iso),
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def feedback_counts_for_rule(
+        self, *, rule_id: str, since_iso: str,
+    ) -> dict[str, int]:
+        """Aggregate counts grouped by feedback_kind. Used for the notification
+        footer (📊 此帳號累計：👍 N / 👎 M / 💰 K)."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT feedback_kind, COUNT(*) AS n FROM sns_post_feedback "
+                "WHERE rule_id = ? AND feedback_at >= ? GROUP BY feedback_kind",
+                (rule_id, since_iso),
+            ).fetchall()
+        return {row["feedback_kind"]: int(row["n"]) for row in rows}
+
+    def set_rule_cooldown(self, rule_id: str, until_iso: str | None) -> bool:
+        with self.connect() as conn:
+            now = utc_now().isoformat()
+            cursor = conn.execute(
+                "UPDATE watch_rules SET cooldown_until = ?, updated_at = ? "
+                "WHERE rule_id = ?",
+                (until_iso, now, rule_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def update_rule_schedule(self, rule_id: str, schedule_minutes: int) -> bool:
+        """Set schedule_minutes on a rule. Clamps to [1, 1440] defensively."""
+        clamped = max(1, min(1440, int(schedule_minutes)))
+        with self.connect() as conn:
+            now = utc_now().isoformat()
+            cursor = conn.execute(
+                "UPDATE watch_rules SET schedule_minutes = ?, updated_at = ? "
+                "WHERE rule_id = ?",
+                (clamped, now, rule_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
 
     def record_tweets(self, rule_id: str, tweets: list[Tweet]) -> list[Tweet]:
         """Insert tweets and return only newly seen ones. First check marks all as notified."""
@@ -340,6 +441,7 @@ class SnsDatabase:
 
         domains = normalize_domains(query.get("domains"))
         source = row["source"] if "source" in row.keys() and row["source"] else "x"
+        cooldown_until = row["cooldown_until"] if "cooldown_until" in row.keys() else None
 
         if kind == "account":
             return AccountWatch(
@@ -354,6 +456,7 @@ class SnsDatabase:
                 chat_id=row["chat_id"],
                 last_checked_at=last_checked,
                 source=source,
+                cooldown_until=cooldown_until,
             )
         elif kind == "keyword":
             return KeywordWatch(
@@ -366,6 +469,7 @@ class SnsDatabase:
                 chat_id=row["chat_id"],
                 last_checked_at=last_checked,
                 source=source,
+                cooldown_until=cooldown_until,
             )
         elif kind == "trend":
             return TrendWatch(
@@ -378,5 +482,6 @@ class SnsDatabase:
                 chat_id=row["chat_id"],
                 last_checked_at=last_checked,
                 source=source,
+                cooldown_until=cooldown_until,
             )
         return None

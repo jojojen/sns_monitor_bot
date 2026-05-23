@@ -26,16 +26,22 @@ class TelegramClient:
         self._timeout_seconds = timeout_seconds
         self._ssl_context = ssl_context or truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
-    def send_message(self, *, chat_id: str | int, text: str) -> dict[str, object]:
-        """Send a text message to a chat."""
-        return self._call(
-            "sendMessage",
-            {
-                "chat_id": str(chat_id),
-                "text": text[:4096],
-                "disable_web_page_preview": True,
-            },
-        )
+    def send_message(
+        self,
+        *,
+        chat_id: str | int,
+        text: str,
+        reply_markup: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Send a text message to a chat, optionally with an inline keyboard."""
+        payload: dict[str, object] = {
+            "chat_id": str(chat_id),
+            "text": text[:4096],
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        return self._call("sendMessage", payload)
 
     def _call(self, method: str, payload: dict[str, object]) -> dict[str, object]:
         """Make a POST request to Telegram Bot API."""

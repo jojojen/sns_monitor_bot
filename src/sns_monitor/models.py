@@ -80,6 +80,7 @@ class AccountWatch:
     chat_id: str = ""
     last_checked_at: datetime | None = None
     source: str = "x"
+    cooldown_until: str | None = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,7 @@ class KeywordWatch:
     chat_id: str = ""
     last_checked_at: datetime | None = None
     source: str = "x"
+    cooldown_until: str | None = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +108,7 @@ class TrendWatch:
     chat_id: str = ""
     last_checked_at: datetime | None = None
     source: str = "x"
+    cooldown_until: str | None = None
 
 
 WatchRule = Union[AccountWatch, KeywordWatch, TrendWatch]

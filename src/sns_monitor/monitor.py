@@ -8,8 +8,17 @@ from pathlib import Path
 from typing import Callable
 
 from .filters import filter_tweets_by_keywords
-from .formatters import format_account_notification, format_keyword_notification, format_trend_notification
-from .models import AccountWatch, KeywordWatch, TrendSnapshot, TrendWatch, utc_now
+from datetime import datetime as _dt_datetime, timezone as _dt_timezone, timedelta as _dt_timedelta
+
+from .formatters import (
+    build_sns_feedback_keyboard,
+    format_account_notification,
+    format_account_post_one,
+    format_keyword_notification,
+    format_keyword_post_one,
+    format_trend_notification,
+)
+from .models import AccountWatch, KeywordWatch, TrendSnapshot, TrendWatch, Tweet, utc_now
 from .sources import SnsSource, build_default_sources
 from .storage import SnsDatabase
 from .x_client import XClient
@@ -133,7 +142,24 @@ class SnsMonitor:
                     logger.exception("Check failed rule_id=%s", rule.rule_id)
 
     def _is_due(self, rule: AccountWatch | KeywordWatch | TrendWatch) -> bool:
-        """Check if a rule is due for checking based on schedule."""
+        """Check if a rule is due for checking based on schedule.
+
+        A rule that's currently in cooldown (set by 👎 feedback) is never
+        due — even if its schedule_minutes would otherwise fire.
+        """
+        cooldown_until = getattr(rule, "cooldown_until", None)
+        if cooldown_until is not None:
+            try:
+                if isinstance(cooldown_until, str):
+                    until_dt = _dt_datetime.fromisoformat(cooldown_until)
+                else:
+                    until_dt = cooldown_until
+                if until_dt.tzinfo is None:
+                    until_dt = until_dt.replace(tzinfo=_dt_timezone.utc)
+                if until_dt > _dt_datetime.now(_dt_timezone.utc):
+                    return False
+            except (ValueError, TypeError):
+                pass  # malformed cooldown_until → fall through, treat as no cooldown
         if rule.last_checked_at is None:
             return True
         elapsed = utc_now() - rule.last_checked_at
@@ -187,12 +213,72 @@ class SnsMonitor:
         if not matching_tweets:
             return
 
-        text = format_account_notification(rule, matching_tweets)
+        self._notify_each_tweet(
+            rule=rule, tweets=matching_tweets,
+            format_one=lambda tw, counts: format_account_post_one(rule, tw, feedback_counts=counts),
+        )
+
+    def _notify_each_tweet(
+        self,
+        *,
+        rule: AccountWatch | KeywordWatch,
+        tweets: list[Tweet],
+        format_one,
+    ) -> None:
+        """Send one Telegram message per tweet so each carries its own
+        👍/👎/💰 feedback keyboard. Failures on individual tweets don't block
+        the others — they're logged and the tweet stays unnotified for retry
+        on the next check."""
+        # Look up the per-rule 30-day feedback aggregate once per batch so we
+        # don't hammer the DB per message.
         try:
-            self._notify_fn(rule.chat_id, text)
-            self._db.mark_tweets_notified(rule.rule_id, [t.tweet_id for t in matching_tweets])
+            since_iso = (
+                _dt_datetime.now(_dt_timezone.utc) - _dt_timedelta(days=30)
+            ).isoformat()
+            feedback_counts = self._db.feedback_counts_for_rule(
+                rule_id=rule.rule_id, since_iso=since_iso,
+            )
         except Exception:
-            logger.exception("Notification failed for rule_id=%s", rule.rule_id)
+            logger.exception(
+                "Failed to load feedback counts for rule_id=%s — proceeding without footer",
+                rule.rule_id,
+            )
+            feedback_counts = {}
+
+        delivered: list[str] = []
+        for tweet in tweets:
+            text = format_one(tweet, feedback_counts)
+            reply_markup = build_sns_feedback_keyboard(
+                tweet_id=tweet.tweet_id, rule_id=rule.rule_id,
+            )
+            try:
+                self._notify_fn(rule.chat_id, text, reply_markup)
+                delivered.append(tweet.tweet_id)
+            except TypeError:
+                # Fallback for legacy notify_fn signatures (chat_id, text).
+                # We still attempt delivery without the keyboard so the user
+                # doesn't lose the alert entirely.
+                try:
+                    self._notify_fn(rule.chat_id, text)  # type: ignore[call-arg]
+                    delivered.append(tweet.tweet_id)
+                    logger.warning(
+                        "notify_fn doesn't accept reply_markup — feedback "
+                        "keyboard skipped for rule_id=%s tweet_id=%s",
+                        rule.rule_id, tweet.tweet_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Notification failed (no-keyboard fallback) rule_id=%s tweet_id=%s",
+                        rule.rule_id, tweet.tweet_id,
+                    )
+            except Exception:
+                logger.exception(
+                    "Notification failed rule_id=%s tweet_id=%s",
+                    rule.rule_id, tweet.tweet_id,
+                )
+
+        if delivered:
+            self._db.mark_tweets_notified(rule.rule_id, delivered)
 
     async def _check_keyword_watch(self, rule: KeywordWatch) -> None:
         """Check a keyword watch rule via its source plugin."""
@@ -208,12 +294,10 @@ class SnsMonitor:
         if is_first or not new_tweets:
             return
 
-        text = format_keyword_notification(rule, new_tweets)
-        try:
-            self._notify_fn(rule.chat_id, text)
-            self._db.mark_tweets_notified(rule.rule_id, [t.tweet_id for t in new_tweets])
-        except Exception:
-            logger.exception("Notification failed for rule_id=%s", rule.rule_id)
+        self._notify_each_tweet(
+            rule=rule, tweets=new_tweets,
+            format_one=lambda tw, counts: format_keyword_post_one(rule, tw, feedback_counts=counts),
+        )
 
     async def _check_trend_watch(self, rule: TrendWatch) -> None:
         """Check a trend watch rule via its source plugin."""
