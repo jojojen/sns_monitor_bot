@@ -64,6 +64,7 @@ class SnsMonitor:
         alias_source: _AliasSource | None = None,
         knowledge_retriever: Callable[[tuple[str, ...]], str] | None = None,
         entity_research_fn: Callable[[str], bool] | None = None,
+        ip_heat_retriever: Callable[[tuple[str, ...]], str] | None = None,
         monitor_db_path: str | Path | None = None,
         opportunity_db_path: str | Path | None = None,
         min_score_to_push: int = DEFAULT_MIN_SCORE_TO_PUSH,
@@ -88,6 +89,7 @@ class SnsMonitor:
         self._alias_source = alias_source
         self._knowledge_retriever = knowledge_retriever
         self._entity_research_fn = entity_research_fn
+        self._ip_heat_retriever = ip_heat_retriever
         self._monitor_db_path = Path(monitor_db_path) if monitor_db_path else None
         self._opportunity_db_path = Path(opportunity_db_path) if opportunity_db_path else None
         self._db_path = Path(db_path)
@@ -465,6 +467,15 @@ class SnsMonitor:
 
         matched_entities, knowledge_block, _novel = self._retrieve_knowledge(tweet.text)
 
+        heat_block = ""
+        if self._ip_heat_retriever is not None and matched_entities:
+            try:
+                heat_block = self._ip_heat_retriever(matched_entities) or ""
+            except Exception:
+                logger.exception(
+                    "classifier: ip_heat_retriever failed entities=%s", matched_entities
+                )
+
         signal = classify_sns_signal(
             tweet_id=tweet.tweet_id,
             rule_id=rule.rule_id,
@@ -475,6 +486,7 @@ class SnsMonitor:
             pinned_targets=profile.pinned_targets,
             feedback_for_rule=feedback_for_rule,
             knowledge_block=knowledge_block,
+            heat_block=heat_block,
             matched_entities=matched_entities,
             llm_fn=self._classifier_llm_fn,
         )

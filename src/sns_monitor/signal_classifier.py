@@ -51,6 +51,7 @@ def build_classifier_prompt(
     pinned_targets: Sequence[str],
     feedback_for_rule: Mapping[str, int],
     knowledge_block: str,
+    heat_block: str = "",
 ) -> str:
     """Compose the LLM prompt. Public for testability — assert against
     rendered text in unit tests."""
@@ -87,7 +88,14 @@ def build_classifier_prompt(
         "請以推文為主、知識庫為輔）：\n"
         f"{knowledge_block}\n"
         "\n"
-        "推文內容：\n"
+        + (
+            "IP 熱度指標（最新，跨 X mention / Reddit / Google Trends 的 30 日 percentile）：\n"
+            f"{heat_block}\n"
+            "（percentile ≥ 70 = 近期熱度明顯高於歷史均值，可對 long_term_score 加成 +5~+15）\n"
+            "\n"
+            if heat_block else ""
+        )
+        + "推文內容：\n"
         f"作者：@{author_handle}\n"
         f"時間：{created_at}\n"
         "文字：\n"
@@ -190,6 +198,7 @@ def classify_sns_signal(
     pinned_targets: Sequence[str],
     feedback_for_rule: Mapping[str, int],
     knowledge_block: str,
+    heat_block: str = "",
     matched_entities: tuple[str, ...],
     llm_fn: Callable[[str], str] | None,
 ) -> SnsPostSignal:
@@ -208,6 +217,7 @@ def classify_sns_signal(
         tweet_text=tweet_text,
         watchlist_queries=watchlist_queries, pinned_targets=pinned_targets,
         feedback_for_rule=feedback_for_rule, knowledge_block=knowledge_block,
+        heat_block=heat_block,
     )
     try:
         raw = llm_fn(prompt)

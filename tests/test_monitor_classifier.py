@@ -46,6 +46,7 @@ def _make_monitor(*, llm_fn, min_score=60, alias_source=None):
     monitor._alias_source = alias_source or _StubAliasSource()
     monitor._knowledge_retriever = None
     monitor._entity_research_fn = None
+    monitor._ip_heat_retriever = None
     monitor._monitor_db_path = None
     monitor._opportunity_db_path = None
     from pathlib import Path

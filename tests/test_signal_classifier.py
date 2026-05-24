@@ -237,3 +237,46 @@ def test_decide_push_reason_respects_custom_threshold():
     sig = _signal(lt=40, arb=40)
     assert decide_push_reason(signal=sig, keyword_matched=False, min_score=DEFAULT_MIN_SCORE_TO_PUSH) == "none"
     assert decide_push_reason(signal=sig, keyword_matched=False, min_score=30) == "both"
+
+
+# ── heat_block injection ─────────────────────────────────────────────────────
+
+
+def test_build_classifier_prompt_includes_heat_block_when_provided():
+    prompt = build_classifier_prompt(
+        tweet_id="t1", author_handle="x", created_at="2026-05-25",
+        tweet_text="チェンソーマン UA 発表",
+        watchlist_queries=(), pinned_targets=(),
+        feedback_for_rule={}, knowledge_block="(無)",
+        heat_block="- チェンソーマン: x_mention percentile=87, google_trends percentile=92",
+    )
+    assert "IP 熱度指標" in prompt
+    assert "percentile=87" in prompt
+    assert "percentile=92" in prompt
+
+
+def test_build_classifier_prompt_no_heat_block_section_when_empty():
+    prompt = build_classifier_prompt(
+        tweet_id="t1", author_handle="x", created_at="2026-05-25",
+        tweet_text="test tweet",
+        watchlist_queries=(), pinned_targets=(),
+        feedback_for_rule={}, knowledge_block="(無)",
+        heat_block="",
+    )
+    assert "IP 熱度指標" not in prompt
+
+
+def test_classify_sns_signal_passes_heat_block_to_prompt():
+    captured: list[str] = []
+
+    def fake_llm(prompt: str) -> str:
+        captured.append(prompt)
+        return '{"long_term_score":70,"arbitrage_score":50,"matched_products":[],"matched_keywords":[],"suggested_action":"test","rationale":"test","deadline":null}'
+
+    kwargs = _make_kwargs(
+        llm_fn=fake_llm,
+        heat_block="- チェンソーマン: x_mention percentile=90",
+    )
+    classify_sns_signal(**kwargs)
+    assert captured, "LLM was not called"
+    assert "percentile=90" in captured[0]
