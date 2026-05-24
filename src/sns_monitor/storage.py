@@ -89,6 +89,30 @@ class SnsDatabase:
                     ON sns_post_feedback(tweet_id);
                 CREATE INDEX IF NOT EXISTS idx_sns_post_feedback_rule_kind_at
                     ON sns_post_feedback(rule_id, feedback_kind, feedback_at);
+
+                CREATE TABLE IF NOT EXISTS sns_post_signals (
+                    tweet_id              TEXT NOT NULL,
+                    rule_id               TEXT NOT NULL,
+                    long_term_score       INTEGER NOT NULL,
+                    arbitrage_score       INTEGER NOT NULL,
+                    matched_products_json TEXT NOT NULL DEFAULT '[]',
+                    matched_keywords_json TEXT NOT NULL DEFAULT '[]',
+                    matched_entities_json TEXT NOT NULL DEFAULT '[]',
+                    suggested_action      TEXT NOT NULL DEFAULT '',
+                    rationale             TEXT NOT NULL DEFAULT '',
+                    deadline              TEXT,
+                    bypass_reason         TEXT NOT NULL DEFAULT 'none',
+                    pushed                INTEGER NOT NULL DEFAULT 0,
+                    classified_at         TEXT NOT NULL,
+                    PRIMARY KEY (tweet_id, rule_id),
+                    FOREIGN KEY (rule_id) REFERENCES watch_rules(rule_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_sns_post_signals_long_term
+                    ON sns_post_signals(long_term_score);
+                CREATE INDEX IF NOT EXISTS idx_sns_post_signals_arbitrage
+                    ON sns_post_signals(arbitrage_score);
+                CREATE INDEX IF NOT EXISTS idx_sns_post_signals_pushed_at
+                    ON sns_post_signals(pushed, classified_at);
                 """
             )
             # Idempotent ALTER TABLE for older DBs.
@@ -287,6 +311,94 @@ class SnsDatabase:
             )
             conn.commit()
             return cursor.rowcount > 0
+
+    # ── SNS signal classifications (RAG / two-opportunity classifier) ───────
+
+    def record_sns_signal(
+        self,
+        *,
+        tweet_id: str,
+        rule_id: str,
+        long_term_score: int,
+        arbitrage_score: int,
+        matched_products: tuple[str, ...] = (),
+        matched_keywords: tuple[str, ...] = (),
+        matched_entities: tuple[str, ...] = (),
+        suggested_action: str = "",
+        rationale: str = "",
+        deadline: str | None = None,
+        bypass_reason: str = "none",
+        pushed: bool = False,
+    ) -> None:
+        """Upsert a classification result. Caller fires this regardless of
+        whether the tweet was pushed — non-pushed rows are valuable for
+        future ``/digest`` and threshold tuning."""
+        now = utc_now().isoformat()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO sns_post_signals (
+                    tweet_id, rule_id, long_term_score, arbitrage_score,
+                    matched_products_json, matched_keywords_json, matched_entities_json,
+                    suggested_action, rationale, deadline, bypass_reason, pushed,
+                    classified_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tweet_id, rule_id) DO UPDATE SET
+                    long_term_score = excluded.long_term_score,
+                    arbitrage_score = excluded.arbitrage_score,
+                    matched_products_json = excluded.matched_products_json,
+                    matched_keywords_json = excluded.matched_keywords_json,
+                    matched_entities_json = excluded.matched_entities_json,
+                    suggested_action = excluded.suggested_action,
+                    rationale = excluded.rationale,
+                    deadline = excluded.deadline,
+                    bypass_reason = excluded.bypass_reason,
+                    pushed = excluded.pushed,
+                    classified_at = excluded.classified_at
+                """,
+                (
+                    tweet_id, rule_id,
+                    int(long_term_score), int(arbitrage_score),
+                    json.dumps(list(matched_products), ensure_ascii=False),
+                    json.dumps(list(matched_keywords), ensure_ascii=False),
+                    json.dumps(list(matched_entities), ensure_ascii=False),
+                    suggested_action or "", rationale or "", deadline,
+                    bypass_reason, 1 if pushed else 0, now,
+                ),
+            )
+            conn.commit()
+
+    def get_sns_signal(self, *, tweet_id: str, rule_id: str) -> dict[str, object] | None:
+        """Fetch the cached classification for a (tweet, rule) pair if any.
+        Used by the monitor to skip re-classifying within the same tick."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM sns_post_signals WHERE tweet_id = ? AND rule_id = ?",
+                (tweet_id, rule_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def list_unpushed_signals_with_score(
+        self, *, min_score: int = 60, limit: int = 50,
+    ) -> list[dict[str, object]]:
+        """For a future ``/digest`` view: borderline-but-dropped tweets."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.*, t.text, t.author_handle, t.created_at
+                FROM sns_post_signals s
+                LEFT JOIN seen_tweets t USING (tweet_id, rule_id)
+                WHERE s.pushed = 0
+                  AND (s.long_term_score >= ? OR s.arbitrage_score >= ?)
+                ORDER BY s.classified_at DESC
+                LIMIT ?
+                """,
+                (int(min_score), int(min_score), int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def record_tweets(self, rule_id: str, tweets: list[Tweet]) -> list[Tweet]:
         """Insert tweets and return only newly seen ones. First check marks all as notified."""

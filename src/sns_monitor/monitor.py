@@ -10,15 +10,28 @@ from typing import Callable
 from .filters import filter_tweets_by_keywords
 from datetime import datetime as _dt_datetime, timezone as _dt_timezone, timedelta as _dt_timedelta
 
+from .entity_extractor import _AliasSource, extract_entities
 from .formatters import (
     build_sns_feedback_keyboard,
     format_account_notification,
     format_account_post_one,
     format_keyword_notification,
     format_keyword_post_one,
+    format_signal_notification,
     format_trend_notification,
 )
+from .interest_profile import (
+    UserInterestProfile,
+    aggregate_rule_feedback,
+    build_user_interest_profile,
+)
 from .models import AccountWatch, KeywordWatch, TrendSnapshot, TrendWatch, Tweet, utc_now
+from .signal_classifier import (
+    DEFAULT_MIN_SCORE_TO_PUSH,
+    SnsPostSignal,
+    classify_sns_signal,
+    decide_push_reason,
+)
 from .sources import SnsSource, build_default_sources
 from .storage import SnsDatabase
 from .x_client import XClient
@@ -42,6 +55,18 @@ class SnsMonitor:
         interval_seconds: int = 60,
         sources: dict[str, SnsSource] | None = None,
         x_client: XClient | None = None,
+        # ── Two-opportunity RAG classifier (all optional) ────────────────
+        # When ``classifier_llm_fn`` is None the monitor falls back to the
+        # legacy per-tweet notify path (no scoring, no signal headlines).
+        # Without these wired in production behaves identically to before.
+        classifier_llm_fn: Callable[[str], str] | None = None,
+        entity_extraction_llm_fn: Callable[[str], str] | None = None,
+        alias_source: _AliasSource | None = None,
+        knowledge_retriever: Callable[[tuple[str, ...]], str] | None = None,
+        entity_research_fn: Callable[[str], bool] | None = None,
+        monitor_db_path: str | Path | None = None,
+        opportunity_db_path: str | Path | None = None,
+        min_score_to_push: int = DEFAULT_MIN_SCORE_TO_PUSH,
     ) -> None:
         if sources is None:
             sources = build_default_sources(x_client=x_client)
@@ -57,6 +82,19 @@ class SnsMonitor:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        # ── Classifier dependencies (None-safe; legacy path used if absent) ─
+        self._classifier_llm_fn = classifier_llm_fn
+        self._entity_extraction_llm_fn = entity_extraction_llm_fn
+        self._alias_source = alias_source
+        self._knowledge_retriever = knowledge_retriever
+        self._entity_research_fn = entity_research_fn
+        self._monitor_db_path = Path(monitor_db_path) if monitor_db_path else None
+        self._opportunity_db_path = Path(opportunity_db_path) if opportunity_db_path else None
+        self._db_path = Path(db_path)
+        self._min_score_to_push = min_score_to_push
+        # Cache user profile per chat_id within one tick — built lazily,
+        # cleared every tick so feedback updates are reflected quickly.
+        self._profile_cache: dict[str, UserInterestProfile] = {}
 
     def start(self) -> None:
         """Start the monitoring daemon thread."""
@@ -132,6 +170,10 @@ class SnsMonitor:
         except Exception:
             logger.exception("Failed to list watch rules")
             return
+
+        # Clear interest-profile cache so feedback / watchlist edits from the
+        # previous tick are picked up.
+        self._profile_cache.clear()
 
         enabled = [r for r in rules if r.enabled]
         for rule in enabled:
@@ -213,10 +255,13 @@ class SnsMonitor:
         if not matching_tweets:
             return
 
-        self._notify_each_tweet(
-            rule=rule, tweets=matching_tweets,
-            format_one=lambda tw, counts: format_account_post_one(rule, tw, feedback_counts=counts),
-        )
+        if self._classifier_llm_fn is not None:
+            self._classify_and_notify(rule=rule, tweets=matching_tweets)
+        else:
+            self._notify_each_tweet(
+                rule=rule, tweets=matching_tweets,
+                format_one=lambda tw, counts: format_account_post_one(rule, tw, feedback_counts=counts),
+            )
 
     def _notify_each_tweet(
         self,
@@ -280,6 +325,229 @@ class SnsMonitor:
         if delivered:
             self._db.mark_tweets_notified(rule.rule_id, delivered)
 
+    # ── Two-opportunity classifier pipeline ────────────────────────────────
+
+    def _get_or_build_profile(self, chat_id: str) -> UserInterestProfile:
+        """Build (and cache, per-tick) the user's interest profile.
+
+        If the cross-DB paths aren't configured we still return a profile
+        struct — just with empty watchlist / pinned / feedback fields, so the
+        classifier doesn't crash and treats it as 'unconstrained'."""
+        cached = self._profile_cache.get(chat_id)
+        if cached is not None:
+            return cached
+        try:
+            profile = build_user_interest_profile(
+                chat_id=chat_id,
+                sns_db_path=self._db_path,
+                monitor_db_path=self._monitor_db_path or self._db_path,
+                opportunity_db_path=self._opportunity_db_path or self._db_path,
+            )
+        except Exception:
+            logger.exception("classifier: failed to build user profile chat_id=%s", chat_id)
+            profile = UserInterestProfile(chat_id=str(chat_id))
+        self._profile_cache[chat_id] = profile
+        return profile
+
+    def _find_matched_keyword(
+        self, rule: AccountWatch | KeywordWatch, tweet_text: str
+    ) -> str | None:
+        """Return the first include_keyword that appears in the tweet, or None.
+
+        For KeywordWatch this is N/A (the caller passes ``force_bypass_keyword``
+        directly with ``rule.query``)."""
+        if not isinstance(rule, AccountWatch):
+            return None
+        if not rule.include_keywords:
+            return None
+        text_lower = (tweet_text or "").lower()
+        for kw in rule.include_keywords:
+            if kw and kw.lower() in text_lower:
+                return kw
+        return None
+
+    def _retrieve_knowledge(
+        self, tweet_text: str
+    ) -> tuple[tuple[str, ...], str, tuple[str, ...]]:
+        """Run entity extraction + knowledge retrieval. Returns
+        ``(matched_entities, knowledge_block, novel_mentions)``.
+
+        Schedules novel mentions for background research if a research
+        function was wired in."""
+        if self._alias_source is None:
+            return (), "(無)", ()
+        try:
+            known, novel = extract_entities(
+                tweet_text,
+                alias_source=self._alias_source,
+                llm_fn=self._entity_extraction_llm_fn,
+            )
+        except Exception:
+            logger.exception("classifier: entity extraction failed")
+            return (), "(無)", ()
+        block = "(無)"
+        if self._knowledge_retriever is not None and known:
+            try:
+                block = self._knowledge_retriever(known) or "(無)"
+            except Exception:
+                logger.exception("classifier: knowledge retrieval failed entities=%s", known)
+        if self._entity_research_fn is not None:
+            for entity in novel:
+                try:
+                    self._entity_research_fn(entity)
+                except Exception:
+                    logger.exception("classifier: entity research enqueue failed entity=%s", entity)
+        return known, block, novel
+
+    def _classify_and_notify(
+        self,
+        *,
+        rule: AccountWatch | KeywordWatch,
+        tweets: list[Tweet],
+        force_bypass_keyword: str | None = None,
+    ) -> None:
+        """RAG-driven push path: classify every tweet, persist score, push
+        only when Bypass A fires or a score gate clears.
+
+        Even dropped tweets are written to ``sns_post_signals`` with
+        ``pushed=0`` so /digest can mine them later.
+        """
+        profile = self._get_or_build_profile(rule.chat_id)
+        feedback_for_rule = aggregate_rule_feedback(profile, rule.rule_id)
+        # Same per-batch footer as the legacy path.
+        try:
+            since_iso = (
+                _dt_datetime.now(_dt_timezone.utc) - _dt_timedelta(days=30)
+            ).isoformat()
+            footer_counts = self._db.feedback_counts_for_rule(
+                rule_id=rule.rule_id, since_iso=since_iso,
+            )
+        except Exception:
+            logger.exception(
+                "classifier: feedback counts lookup failed rule_id=%s", rule.rule_id,
+            )
+            footer_counts = {}
+
+        delivered: list[str] = []
+        for tweet in tweets:
+            try:
+                self._classify_one_and_maybe_push(
+                    rule=rule, tweet=tweet,
+                    profile=profile,
+                    feedback_for_rule=feedback_for_rule,
+                    footer_counts=footer_counts,
+                    force_bypass_keyword=force_bypass_keyword,
+                    delivered=delivered,
+                )
+            except Exception:
+                logger.exception(
+                    "classifier: per-tweet pipeline failed rule_id=%s tweet_id=%s",
+                    rule.rule_id, tweet.tweet_id,
+                )
+        if delivered:
+            self._db.mark_tweets_notified(rule.rule_id, delivered)
+
+    def _classify_one_and_maybe_push(
+        self,
+        *,
+        rule: AccountWatch | KeywordWatch,
+        tweet: Tweet,
+        profile: UserInterestProfile,
+        feedback_for_rule: dict[str, int],
+        footer_counts: dict[str, int],
+        force_bypass_keyword: str | None,
+        delivered: list[str],
+    ) -> None:
+        # Skip re-classifying a tweet already scored in a previous tick.
+        cached = self._db.get_sns_signal(tweet_id=tweet.tweet_id, rule_id=rule.rule_id)
+        if cached is not None and cached.get("pushed"):
+            return
+
+        matched_entities, knowledge_block, _novel = self._retrieve_knowledge(tweet.text)
+
+        signal = classify_sns_signal(
+            tweet_id=tweet.tweet_id,
+            rule_id=rule.rule_id,
+            author_handle=tweet.author_handle,
+            created_at=tweet.created_at.strftime("%Y-%m-%d %H:%M UTC"),
+            tweet_text=tweet.text,
+            watchlist_queries=profile.watchlist_queries,
+            pinned_targets=profile.pinned_targets,
+            feedback_for_rule=feedback_for_rule,
+            knowledge_block=knowledge_block,
+            matched_entities=matched_entities,
+            llm_fn=self._classifier_llm_fn,
+        )
+
+        if force_bypass_keyword is not None:
+            bypass_keyword = force_bypass_keyword
+            keyword_matched = True
+        else:
+            bypass_keyword = self._find_matched_keyword(rule, tweet.text)
+            keyword_matched = bypass_keyword is not None
+
+        reason = decide_push_reason(
+            signal=signal,
+            keyword_matched=keyword_matched,
+            min_score=self._min_score_to_push,
+        )
+        should_push = reason != "none"
+
+        try:
+            self._db.record_sns_signal(
+                tweet_id=signal.tweet_id, rule_id=signal.rule_id,
+                long_term_score=signal.long_term_score,
+                arbitrage_score=signal.arbitrage_score,
+                matched_products=signal.matched_products,
+                matched_keywords=signal.matched_keywords,
+                matched_entities=signal.matched_entities,
+                suggested_action=signal.suggested_action,
+                rationale=signal.rationale,
+                deadline=signal.deadline_iso,
+                bypass_reason=reason,
+                pushed=1 if should_push else 0,
+            )
+        except Exception:
+            logger.exception(
+                "classifier: failed to persist signal rule_id=%s tweet_id=%s",
+                rule.rule_id, tweet.tweet_id,
+            )
+
+        if not should_push:
+            logger.info(
+                "classifier: drop tweet_id=%s rule_id=%s lt=%d arb=%d reason=%s",
+                tweet.tweet_id, rule.rule_id,
+                signal.long_term_score, signal.arbitrage_score, reason,
+            )
+            return
+
+        text = format_signal_notification(
+            rule=rule, tweet=tweet, signal=signal,
+            bypass_reason=reason,
+            bypass_keyword=bypass_keyword if reason == "explicit_keyword" else None,
+            feedback_counts=footer_counts,
+        )
+        reply_markup = build_sns_feedback_keyboard(
+            tweet_id=tweet.tweet_id, rule_id=rule.rule_id,
+        )
+        try:
+            self._notify_fn(rule.chat_id, text, reply_markup)
+            delivered.append(tweet.tweet_id)
+        except TypeError:
+            try:
+                self._notify_fn(rule.chat_id, text)  # type: ignore[call-arg]
+                delivered.append(tweet.tweet_id)
+            except Exception:
+                logger.exception(
+                    "classifier: notify failed (no-keyboard fallback) rule_id=%s tweet_id=%s",
+                    rule.rule_id, tweet.tweet_id,
+                )
+        except Exception:
+            logger.exception(
+                "classifier: notify failed rule_id=%s tweet_id=%s",
+                rule.rule_id, tweet.tweet_id,
+            )
+
     async def _check_keyword_watch(self, rule: KeywordWatch) -> None:
         """Check a keyword watch rule via its source plugin."""
         source = self._source_for(rule)
@@ -294,10 +562,17 @@ class SnsMonitor:
         if is_first or not new_tweets:
             return
 
-        self._notify_each_tweet(
-            rule=rule, tweets=new_tweets,
-            format_one=lambda tw, counts: format_keyword_post_one(rule, tw, feedback_counts=counts),
-        )
+        if self._classifier_llm_fn is not None:
+            # Keyword watches are by definition "explicit keyword" — the user
+            # searched for ``rule.query``, so Bypass A always applies. We still
+            # run the classifier so the DB has a score record per tweet, but
+            # gate decision is always 'explicit_keyword' for keyword watches.
+            self._classify_and_notify(rule=rule, tweets=new_tweets, force_bypass_keyword=rule.query)
+        else:
+            self._notify_each_tweet(
+                rule=rule, tweets=new_tweets,
+                format_one=lambda tw, counts: format_keyword_post_one(rule, tw, feedback_counts=counts),
+            )
 
     async def _check_trend_watch(self, rule: TrendWatch) -> None:
         """Check a trend watch rule via its source plugin."""
@@ -351,6 +626,14 @@ def ensure_monitor(
     interval_seconds: int = 60,
     x_client: XClient | None = None,
     sources: dict[str, SnsSource] | None = None,
+    classifier_llm_fn: Callable[[str], str] | None = None,
+    entity_extraction_llm_fn: Callable[[str], str] | None = None,
+    alias_source: _AliasSource | None = None,
+    knowledge_retriever: Callable[[tuple[str, ...]], str] | None = None,
+    entity_research_fn: Callable[[str], bool] | None = None,
+    monitor_db_path: str | Path | None = None,
+    opportunity_db_path: str | Path | None = None,
+    min_score_to_push: int = DEFAULT_MIN_SCORE_TO_PUSH,
 ) -> tuple[SnsMonitor, bool]:
     """Get or create the singleton monitor. Returns (monitor, is_new)."""
     global _monitor
@@ -363,6 +646,14 @@ def ensure_monitor(
             sources=sources,
             notify_fn=notify_fn,
             interval_seconds=interval_seconds,
+            classifier_llm_fn=classifier_llm_fn,
+            entity_extraction_llm_fn=entity_extraction_llm_fn,
+            alias_source=alias_source,
+            knowledge_retriever=knowledge_retriever,
+            entity_research_fn=entity_research_fn,
+            monitor_db_path=monitor_db_path,
+            opportunity_db_path=opportunity_db_path,
+            min_score_to_push=min_score_to_push,
         )
         _monitor.start()
         return _monitor, True
