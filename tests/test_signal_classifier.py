@@ -60,6 +60,30 @@ def test_build_classifier_prompt_includes_user_signals_and_knowledge():
     assert "arbitrage_score" in prompt
 
 
+def test_build_classifier_prompt_includes_ex_ante_signal_rubric():
+    """A3: rubric must teach the LLM to give 60+ score for IP × TCG collab
+    announcements, 予約開始, アニメ phase decisions etc., even when the product
+    is not yet in user watchlist — these are the chainsaw-ua use case signals."""
+    prompt = build_classifier_prompt(
+        tweet_id="t", author_handle="x", created_at="2026",
+        tweet_text="any",
+        watchlist_queries=(), pinned_targets=(), feedback_for_rule={},
+        knowledge_block="(無)",
+    )
+    # Section header must appear
+    assert "Ex-ante 事前訊號特別加權" in prompt
+    # Specific ex-ante signal types must be enumerated
+    assert "IP × TCG collab 公告" in prompt
+    assert "予約開始" in prompt
+    assert "抽選販賣公告" in prompt
+    assert "アニメ第 N 期発表" in prompt
+    assert "新弾発売決定" in prompt
+    # Must explicitly state the score floor for ex-ante signals even when
+    # the product is NOT in user watchlist — this is the key behaviour
+    # the chainsaw-ua use case depends on.
+    assert "60+" in prompt or "60+ 分" in prompt
+
+
 def test_build_classifier_prompt_uses_placeholder_for_empty_lists():
     prompt = build_classifier_prompt(
         tweet_id="t", author_handle="x", created_at="2026",

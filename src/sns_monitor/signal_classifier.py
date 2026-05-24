@@ -111,7 +111,19 @@ def build_classifier_prompt(
         "- 80-100 = 強訊號（商品在 watchlist / pinned 內、且行動類型明確）\n"
         "\n"
         "兩個分數可同時高（例：「アビスアイ 1BOX 抽選販売」對長期+立即都是強訊號）。\n"
-        "未提到使用者興趣內的商品，最高給到 50（除非為通用 TCG 大事件如 set EOL 公告）。"
+        "未提到使用者興趣內的商品，最高給到 50（除非為通用 TCG 大事件如 set EOL 公告）。\n"
+        "\n"
+        "**Ex-ante 事前訊號特別加權**（這些是高優先級「未來機會」訊號，即使商品還沒在使用者 watchlist）：\n"
+        "- 「IP × TCG collab 公告」(例：『チェンソーマン × UNION ARENA』『鬼滅 × Weiss』)\n"
+        "    → long_term_score 70-85（未來潛力）、若同時開放予約 arbitrage_score 60-80\n"
+        "- 「予約開始」/「抽選販賣公告」+ deadline（例：『6/1 10:00 抽選申込開始』）\n"
+        "    → arbitrage_score 70-90（立即行動）、同時 long_term_score 60-80 若 IP 知名\n"
+        "- 「アニメ第 N 期発表」/「劇場版公開」/「漫畫完結倒數」/「実写化」等 IP 熱度前置訊號\n"
+        "    → long_term_score 60-80（即使尚無 TCG 公告，IP 熱度先行訊號也值得追蹤）\n"
+        "- 「新弾発売決定」/「ブースター発売」/「拡張パック公開」（Bushiroad / UA / Pokemon Center 公式）\n"
+        "    → long_term_score 70-85、若含發售日 arbitrage_score 50-70（為 deadline 留時間）\n"
+        "\n"
+        "判斷時請優先看推文是否帶以上 ex-ante 訊號 — 即使商品不在使用者 watchlist，這類訊號仍應給到 60+ 分。"
     )
 
 
