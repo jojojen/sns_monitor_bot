@@ -113,6 +113,14 @@ class SnsDatabase:
                     ON sns_post_signals(arbitrage_score);
                 CREATE INDEX IF NOT EXISTS idx_sns_post_signals_pushed_at
                     ON sns_post_signals(pushed, classified_at);
+
+                CREATE TABLE IF NOT EXISTS sns_auto_discovery_rejects (
+                    screen_name   TEXT PRIMARY KEY,        -- lowercased handle
+                    original_rule_id TEXT,                 -- rule_id before deletion
+                    domains_json  TEXT NOT NULL DEFAULT '[]',
+                    deleted_at    TEXT NOT NULL,
+                    chat_id       TEXT NOT NULL DEFAULT ''
+                );
                 """
             )
             # Idempotent ALTER TABLE for older DBs.
@@ -163,9 +171,72 @@ class SnsDatabase:
 
     def delete_watch_rule(self, rule_id: str) -> bool:
         with self.connect() as conn:
+            # Before hard-deleting, capture auto-discovered rules so discovery
+            # can avoid re-adding handles the user explicitly removed.
+            row = conn.execute(
+                "SELECT source, label, query_json, chat_id FROM watch_rules WHERE rule_id = ?",
+                (rule_id,),
+            ).fetchone()
+            if row and row["source"] == "auto_discovery":
+                import json as _json
+                try:
+                    query = _json.loads(row["query_json"] or "{}")
+                    screen_name = (query.get("screen_name") or "").lower()
+                    domains_json = _json.dumps(query.get("domains") or [])
+                    chat_id = row["chat_id"] or ""
+                    if screen_name:
+                        conn.execute(
+                            """
+                            INSERT INTO sns_auto_discovery_rejects
+                                (screen_name, original_rule_id, domains_json, deleted_at, chat_id)
+                            VALUES (?, ?, ?, ?, ?)
+                            ON CONFLICT(screen_name) DO UPDATE SET
+                                original_rule_id = excluded.original_rule_id,
+                                domains_json     = excluded.domains_json,
+                                deleted_at       = excluded.deleted_at,
+                                chat_id          = excluded.chat_id
+                            """,
+                            (screen_name, rule_id, domains_json, utc_now().isoformat(), chat_id),
+                        )
+                except Exception:
+                    logger.exception("delete_watch_rule: failed to record rejection for rule_id=%s", rule_id)
             cursor = conn.execute("DELETE FROM watch_rules WHERE rule_id = ?", (rule_id,))
             conn.commit()
             return cursor.rowcount > 0
+
+    def list_rejected_handles(self, *, days: int = 90) -> frozenset[str]:
+        """Return handles deleted within the last `days` days (lowercased).
+
+        Used by discover_tcg_sns_accounts to avoid re-adding recently-rejected
+        auto-discovered accounts."""
+        cutoff = (utc_now() - __import__("datetime").timedelta(days=days)).isoformat()
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT screen_name FROM sns_auto_discovery_rejects WHERE deleted_at >= ?",
+                (cutoff,),
+            ).fetchall()
+        return frozenset(r["screen_name"] for r in rows)
+
+    def auto_discovery_stats(self) -> dict:
+        """Return survival statistics for auto-discovered accounts.
+
+        Returns a dict with keys: total_added, total_rejected, survive_count,
+        survive_rate (float 0-1)."""
+        with self.connect() as conn:
+            total_added = conn.execute(
+                "SELECT COUNT(*) FROM watch_rules WHERE source = 'auto_discovery'"
+            ).fetchone()[0]
+            total_rejected = conn.execute(
+                "SELECT COUNT(*) FROM sns_auto_discovery_rejects"
+            ).fetchone()[0]
+        survive_count = total_added
+        total = survive_count + total_rejected
+        return {
+            "total_added": total_added,
+            "total_rejected": total_rejected,
+            "survive_count": survive_count,
+            "survive_rate": survive_count / total if total else 1.0,
+        }
 
     def toggle_watch_rule(self, rule_id: str, *, enabled: bool) -> bool:
         with self.connect() as conn:
