@@ -79,8 +79,19 @@ class AccountWatch:
     schedule_minutes: int = 15
     chat_id: str = ""
     last_checked_at: datetime | None = None
+    # Platform the account lives on. Used by the SNS monitor runtime to
+    # pick the right source plugin ("x" / "reddit"). NEVER use this field
+    # to mark provenance — see is_auto_discovered for that.
     source: str = "x"
     cooldown_until: str | None = None
+    # Provenance flag — True when the rule was added by the auto-discovery
+    # pipeline (rather than by the user via /snsadd). The runtime uses
+    # `source` to pick the polling plugin and this flag to drive learning
+    # signals (rejection memory, feedback loop). Keeping them orthogonal
+    # is what lets future reddit-sourced auto-discovery sit in the same
+    # table without conflating "where the account lives" with "who put it
+    # in the watchlist".
+    is_auto_discovered: bool = False
 
 
 @dataclass(frozen=True)

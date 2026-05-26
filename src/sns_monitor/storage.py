@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from hashlib import sha1
 from pathlib import Path
 from typing import Iterator
+
+logger = logging.getLogger(__name__)
 
 from .filters import normalize_keyword_filters
 from .models import (
@@ -121,6 +124,42 @@ class SnsDatabase:
                     deleted_at    TEXT NOT NULL,
                     chat_id       TEXT NOT NULL DEFAULT ''
                 );
+
+                -- Polarity-aware feedback timeline for auto-discovery decisions.
+                -- 👍 button writes polarity='positive'; deletion (button or
+                -- /snsdelete) writes polarity='negative'. Used by future
+                -- few-shot pools + observability ("how many auto-adds get
+                -- kept by the user?").
+                CREATE TABLE IF NOT EXISTS sns_auto_discovery_feedback (
+                    feedback_id          TEXT PRIMARY KEY,
+                    screen_name          TEXT NOT NULL,        -- lowercased handle
+                    polarity             TEXT NOT NULL,        -- 'positive' | 'negative'
+                    domains_json         TEXT NOT NULL DEFAULT '[]',
+                    llm_confidence       REAL,
+                    llm_actionable_score REAL,
+                    chat_id              TEXT NOT NULL DEFAULT '',
+                    feedback_at          TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_sns_disc_feedback_handle
+                    ON sns_auto_discovery_feedback(screen_name);
+                CREATE INDEX IF NOT EXISTS idx_sns_disc_feedback_at
+                    ON sns_auto_discovery_feedback(feedback_at);
+
+                -- Per-domain trust score for SNS auto-discovery. Each domain
+                -- the user wants the bot to track (pokemon / yugioh / ws /
+                -- union_arena / tcg) accumulates keep / reject counts and
+                -- carries a monotonically-increasing actionable threshold:
+                -- it can ratchet UP on rejections but never resets DOWN, so
+                -- a noisy domain auto-tightens over time and never quietly
+                -- unwinds back to a permissive state.
+                CREATE TABLE IF NOT EXISTS sns_discovery_domain_trust (
+                    domain               TEXT PRIMARY KEY,
+                    keep_count           INTEGER NOT NULL DEFAULT 0,
+                    reject_count         INTEGER NOT NULL DEFAULT 0,
+                    actionable_threshold REAL NOT NULL DEFAULT 0.75,
+                    first_seen_at        TEXT NOT NULL,
+                    last_updated_at      TEXT NOT NULL
+                );
                 """
             )
             # Idempotent ALTER TABLE for older DBs.
@@ -129,6 +168,23 @@ class SnsDatabase:
                 conn.execute("ALTER TABLE watch_rules ADD COLUMN source TEXT NOT NULL DEFAULT 'x'")
             if "cooldown_until" not in existing_cols:
                 conn.execute("ALTER TABLE watch_rules ADD COLUMN cooldown_until TEXT")
+            if "is_auto_discovered" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE watch_rules ADD COLUMN is_auto_discovered INTEGER NOT NULL DEFAULT 0"
+                )
+                # Backfill: rules previously stamped with the sentinel
+                # source='auto_discovery' carried both the platform *and* the
+                # provenance signal in one field, which crippled monitor
+                # dispatch (the source plugin registry only knows about real
+                # platforms). Move those rules over to the new split: real
+                # platform in `source`, provenance in `is_auto_discovered`.
+                # All historical auto-discovery candidates came from X (the
+                # discovery regex only matches twitter.com / x.com), so the
+                # backfill targets 'x'.
+                conn.execute(
+                    "UPDATE watch_rules SET is_auto_discovered = 1, source = 'x' "
+                    "WHERE source = 'auto_discovery'"
+                )
             conn.commit()
 
     def save_watch_rule(self, rule: WatchRule) -> None:
@@ -150,8 +206,8 @@ class SnsDatabase:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO watch_rules
-                (rule_id, kind, label, query_json, enabled, schedule_minutes, chat_id, last_checked_at, created_at, updated_at, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (rule_id, kind, label, query_json, enabled, schedule_minutes, chat_id, last_checked_at, created_at, updated_at, source, is_auto_discovered)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     rule.rule_id,
@@ -165,6 +221,7 @@ class SnsDatabase:
                     created_at,
                     now,
                     getattr(rule, "source", "x"),
+                    1 if getattr(rule, "is_auto_discovered", False) else 0,
                 ),
             )
             conn.commit()
@@ -174,15 +231,17 @@ class SnsDatabase:
             # Before hard-deleting, capture auto-discovered rules so discovery
             # can avoid re-adding handles the user explicitly removed.
             row = conn.execute(
-                "SELECT source, label, query_json, chat_id FROM watch_rules WHERE rule_id = ?",
+                "SELECT source, is_auto_discovered, label, query_json, chat_id "
+                "FROM watch_rules WHERE rule_id = ?",
                 (rule_id,),
             ).fetchone()
-            if row and row["source"] == "auto_discovery":
+            negative_feedback_args: dict | None = None
+            if row and row["is_auto_discovered"]:
                 import json as _json
                 try:
                     query = _json.loads(row["query_json"] or "{}")
                     screen_name = (query.get("screen_name") or "").lower()
-                    domains_json = _json.dumps(query.get("domains") or [])
+                    domains_list = list(query.get("domains") or [])
                     chat_id = row["chat_id"] or ""
                     if screen_name:
                         conn.execute(
@@ -196,13 +255,36 @@ class SnsDatabase:
                                 deleted_at       = excluded.deleted_at,
                                 chat_id          = excluded.chat_id
                             """,
-                            (screen_name, rule_id, domains_json, utc_now().isoformat(), chat_id),
+                            (screen_name, rule_id, _json.dumps(domains_list), utc_now().isoformat(), chat_id),
                         )
+                        # Stage the polarity-aware feedback write to run AFTER
+                        # the watch_rules DELETE — record_auto_discovery_feedback
+                        # opens its own connection, so we can't nest it here.
+                        negative_feedback_args = {
+                            "screen_name": screen_name,
+                            "domains": tuple(domains_list),
+                            "chat_id": chat_id,
+                        }
                 except Exception:
                     logger.exception("delete_watch_rule: failed to record rejection for rule_id=%s", rule_id)
             cursor = conn.execute("DELETE FROM watch_rules WHERE rule_id = ?", (rule_id,))
             conn.commit()
-            return cursor.rowcount > 0
+        # Record polarity-aware feedback row + bump per-domain trust outside
+        # the connection we just committed. ``record_auto_discovery_feedback``
+        # manages its own transaction so a failure here doesn't roll back the
+        # deletion above (which is the user-visible action).
+        if negative_feedback_args is not None:
+            try:
+                self.record_auto_discovery_feedback(
+                    polarity="negative",
+                    **negative_feedback_args,
+                )
+            except Exception:
+                logger.exception(
+                    "delete_watch_rule: failed to record negative feedback for rule_id=%s",
+                    rule_id,
+                )
+        return cursor.rowcount > 0
 
     def list_rejected_handles(self, *, days: int = 90) -> frozenset[str]:
         """Return handles deleted within the last `days` days (lowercased).
@@ -224,7 +306,7 @@ class SnsDatabase:
         survive_rate (float 0-1)."""
         with self.connect() as conn:
             total_added = conn.execute(
-                "SELECT COUNT(*) FROM watch_rules WHERE source = 'auto_discovery'"
+                "SELECT COUNT(*) FROM watch_rules WHERE is_auto_discovered = 1"
             ).fetchone()[0]
             total_rejected = conn.execute(
                 "SELECT COUNT(*) FROM sns_auto_discovery_rejects"
@@ -236,6 +318,179 @@ class SnsDatabase:
             "total_rejected": total_rejected,
             "survive_count": survive_count,
             "survive_rate": survive_count / total if total else 1.0,
+        }
+
+    # ── Auto-discovery feedback + per-domain trust ────────────────────────
+    DEFAULT_DISCOVERY_ACTIONABLE_THRESHOLD: float = 0.75
+    DISCOVERY_TIGHTENING_STEP: float = 0.05
+    DISCOVERY_MAX_THRESHOLD: float = 0.95
+
+    def record_auto_discovery_feedback(
+        self,
+        *,
+        screen_name: str,
+        polarity: str,
+        domains: tuple[str, ...] = (),
+        llm_confidence: float | None = None,
+        llm_actionable_score: float | None = None,
+        chat_id: str = "",
+    ) -> str:
+        """Append one feedback row + bump per-domain trust. Returns the
+        feedback_id. ``polarity`` must be ``'positive'`` or ``'negative'``;
+        anything else raises ValueError so silent typos do not pollute the
+        learning signal."""
+        if polarity not in {"positive", "negative"}:
+            raise ValueError(f"polarity must be 'positive' or 'negative'; got {polarity!r}")
+        screen_norm = (screen_name or "").lstrip("@").lower()
+        if not screen_norm:
+            raise ValueError("screen_name must be non-empty")
+        now = utc_now().isoformat()
+        feedback_id = sha1(
+            f"{screen_norm}|{polarity}|{now}".encode("utf-8")
+        ).hexdigest()
+        domains_norm = tuple(d for d in (domains or ()) if d)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO sns_auto_discovery_feedback
+                    (feedback_id, screen_name, polarity, domains_json,
+                     llm_confidence, llm_actionable_score, chat_id, feedback_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    feedback_id,
+                    screen_norm,
+                    polarity,
+                    json.dumps(list(domains_norm)),
+                    llm_confidence,
+                    llm_actionable_score,
+                    chat_id or "",
+                    now,
+                ),
+            )
+            self._bump_discovery_domain_trust_locked(
+                conn,
+                domains=domains_norm,
+                kept=(polarity == "positive"),
+                now=now,
+            )
+            conn.commit()
+        return feedback_id
+
+    def _bump_discovery_domain_trust_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        domains: tuple[str, ...],
+        kept: bool,
+        now: str,
+    ) -> None:
+        """Inner mutation — caller owns the connection + commit. For each
+        domain row: bump keep_count or reject_count, and on rejection bump
+        actionable_threshold by DISCOVERY_TIGHTENING_STEP capped at
+        DISCOVERY_MAX_THRESHOLD. Threshold is monotonically increasing —
+        positive feedback never lowers it."""
+        for domain in domains:
+            existing = conn.execute(
+                "SELECT keep_count, reject_count, actionable_threshold "
+                "FROM sns_discovery_domain_trust WHERE domain = ?",
+                (domain,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO sns_discovery_domain_trust "
+                    "(domain, keep_count, reject_count, actionable_threshold, "
+                    "first_seen_at, last_updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        domain,
+                        1 if kept else 0,
+                        0 if kept else 1,
+                        self.DEFAULT_DISCOVERY_ACTIONABLE_THRESHOLD if kept
+                        else min(
+                            self.DISCOVERY_MAX_THRESHOLD,
+                            self.DEFAULT_DISCOVERY_ACTIONABLE_THRESHOLD
+                            + self.DISCOVERY_TIGHTENING_STEP,
+                        ),
+                        now,
+                        now,
+                    ),
+                )
+                continue
+            keep_count = existing["keep_count"] + (1 if kept else 0)
+            reject_count = existing["reject_count"] + (0 if kept else 1)
+            if kept:
+                new_threshold = existing["actionable_threshold"]
+            else:
+                new_threshold = min(
+                    self.DISCOVERY_MAX_THRESHOLD,
+                    existing["actionable_threshold"] + self.DISCOVERY_TIGHTENING_STEP,
+                )
+            conn.execute(
+                "UPDATE sns_discovery_domain_trust "
+                "SET keep_count = ?, reject_count = ?, "
+                "    actionable_threshold = ?, last_updated_at = ? "
+                "WHERE domain = ?",
+                (keep_count, reject_count, new_threshold, now, domain),
+            )
+
+    def effective_actionable_threshold(
+        self,
+        domains,
+        *,
+        default: float | None = None,
+    ) -> float:
+        """Return the strictest (max) actionable threshold across the given
+        candidate domains. Domains the system has not yet seen contribute
+        ``default`` (cold-start floor). Used by auto-discovery to decide
+        whether a candidate's LLM-supplied actionable score is high enough
+        to clear the per-domain bar."""
+        default_value = (
+            default if default is not None else self.DEFAULT_DISCOVERY_ACTIONABLE_THRESHOLD
+        )
+        domain_list = [d for d in (domains or ()) if d]
+        if not domain_list:
+            return default_value
+        with self.connect() as conn:
+            placeholders = ",".join(["?"] * len(domain_list))
+            rows = conn.execute(
+                f"SELECT domain, actionable_threshold FROM sns_discovery_domain_trust "
+                f"WHERE domain IN ({placeholders})",
+                tuple(domain_list),
+            ).fetchall()
+        threshold_map = {row["domain"]: row["actionable_threshold"] for row in rows}
+        return max(
+            (threshold_map.get(d, default_value) for d in domain_list),
+            default=default_value,
+        )
+
+    def auto_discovery_feedback_summary(self) -> dict:
+        """Returns aggregate per-polarity counts + per-domain threshold map.
+        For observability — surfaces how the discovery system has tightened
+        over time without callers having to query the tables directly."""
+        with self.connect() as conn:
+            counts: dict[str, int] = {}
+            for row in conn.execute(
+                "SELECT polarity, COUNT(*) AS c FROM sns_auto_discovery_feedback "
+                "GROUP BY polarity"
+            ).fetchall():
+                counts[row["polarity"]] = int(row["c"])
+            domain_rows = conn.execute(
+                "SELECT domain, keep_count, reject_count, actionable_threshold "
+                "FROM sns_discovery_domain_trust ORDER BY domain"
+            ).fetchall()
+        return {
+            "positive_count": counts.get("positive", 0),
+            "negative_count": counts.get("negative", 0),
+            "per_domain": [
+                {
+                    "domain": row["domain"],
+                    "keep_count": row["keep_count"],
+                    "reject_count": row["reject_count"],
+                    "actionable_threshold": row["actionable_threshold"],
+                }
+                for row in domain_rows
+            ],
         }
 
     def toggle_watch_rule(self, rule_id: str, *, enabled: bool) -> bool:
@@ -625,6 +880,7 @@ class SnsDatabase:
         domains = normalize_domains(query.get("domains"))
         source = row["source"] if "source" in row.keys() and row["source"] else "x"
         cooldown_until = row["cooldown_until"] if "cooldown_until" in row.keys() else None
+        is_auto_discovered = bool(row["is_auto_discovered"]) if "is_auto_discovered" in row.keys() else False
 
         if kind == "account":
             return AccountWatch(
@@ -640,6 +896,7 @@ class SnsDatabase:
                 last_checked_at=last_checked,
                 source=source,
                 cooldown_until=cooldown_until,
+                is_auto_discovered=is_auto_discovered,
             )
         elif kind == "keyword":
             return KeywordWatch(
