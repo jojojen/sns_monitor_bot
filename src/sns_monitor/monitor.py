@@ -63,12 +63,20 @@ class SnsMonitor:
         entity_extraction_llm_fn: Callable[[str], str] | None = None,
         alias_source: _AliasSource | None = None,
         knowledge_retriever: Callable[[tuple[str, ...]], str] | None = None,
+        knowledge_appender: Callable[[dict], None] | None = None,
         entity_research_fn: Callable[[str], bool] | None = None,
         ip_heat_retriever: Callable[[tuple[str, ...]], str] | None = None,
         monitor_db_path: str | Path | None = None,
         opportunity_db_path: str | Path | None = None,
         min_score_to_push: int = DEFAULT_MIN_SCORE_TO_PUSH,
     ) -> None:
+        """``knowledge_appender`` receives a dict per silenced signal and is
+        expected to persist it into the long-running knowledge base. Contract:
+        ``{"entity": str, "observed_at": str (ISO8601), "rationale": str,
+           "suggested_action": str, "tweet_url": str, "deadline": str | None}``.
+        Wiring lives in aka_no_claw/openclaw_adapter/sns_tools.py — kept as an
+        opaque Callable so sns_monitor_bot has no direct dependency on the
+        knowledge DB implementation."""
         if sources is None:
             sources = build_default_sources(x_client=x_client)
         if "x" not in sources and x_client is not None:
@@ -88,6 +96,7 @@ class SnsMonitor:
         self._entity_extraction_llm_fn = entity_extraction_llm_fn
         self._alias_source = alias_source
         self._knowledge_retriever = knowledge_retriever
+        self._knowledge_appender = knowledge_appender
         self._entity_research_fn = entity_research_fn
         self._ip_heat_retriever = ip_heat_retriever
         self._monitor_db_path = Path(monitor_db_path) if monitor_db_path else None
@@ -526,10 +535,29 @@ class SnsMonitor:
             )
 
         if not should_push:
+            if self._knowledge_appender is not None and signal.matched_entities:
+                observed_at = tweet.created_at.isoformat()
+                tweet_url = f"https://x.com/{tweet.author_handle}/status/{tweet.tweet_id}"
+                for ent in signal.matched_entities:
+                    try:
+                        self._knowledge_appender({
+                            "entity": ent,
+                            "observed_at": observed_at,
+                            "rationale": signal.rationale,
+                            "suggested_action": signal.suggested_action,
+                            "tweet_url": tweet_url,
+                            "deadline": signal.deadline_iso,
+                        })
+                    except Exception:
+                        logger.exception(
+                            "classifier: knowledge_appender failed entity=%s", ent,
+                        )
             logger.info(
-                "classifier: drop tweet_id=%s rule_id=%s lt=%d arb=%d reason=%s",
+                "classifier: silenced tweet_id=%s rule_id=%s lt=%d arb=%d "
+                "actionability=%s reason=%s entities=%s",
                 tweet.tweet_id, rule.rule_id,
-                signal.long_term_score, signal.arbitrage_score, reason,
+                signal.long_term_score, signal.arbitrage_score,
+                signal.actionability, reason, signal.matched_entities,
             )
             return
 
@@ -642,6 +670,7 @@ def ensure_monitor(
     entity_extraction_llm_fn: Callable[[str], str] | None = None,
     alias_source: _AliasSource | None = None,
     knowledge_retriever: Callable[[tuple[str, ...]], str] | None = None,
+    knowledge_appender: Callable[[dict], None] | None = None,
     entity_research_fn: Callable[[str], bool] | None = None,
     monitor_db_path: str | Path | None = None,
     opportunity_db_path: str | Path | None = None,
@@ -662,6 +691,7 @@ def ensure_monitor(
             entity_extraction_llm_fn=entity_extraction_llm_fn,
             alias_source=alias_source,
             knowledge_retriever=knowledge_retriever,
+            knowledge_appender=knowledge_appender,
             entity_research_fn=entity_research_fn,
             monitor_db_path=monitor_db_path,
             opportunity_db_path=opportunity_db_path,

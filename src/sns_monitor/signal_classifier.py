@@ -35,6 +35,8 @@ class SnsPostSignal:
     suggested_action: str               # one-line imperative
     rationale: str                      # ≤ 60-char "why this score"
     deadline_iso: str | None            # ISO8601 if extractable, else None
+    actionability: str = "vague"        # "concrete" | "vague" — silence-first default
+    purchase_target_json: str | None = None  # JSON {sku_or_title, purchase_url, price_hint} when concrete
 
 
 # Score thresholds — kept here so tests can override without re-deploying.
@@ -109,7 +111,9 @@ def build_classifier_prompt(
         '  "matched_keywords": ["..."],\n'
         '  "suggested_action": "一句話、imperative、繁體中文",\n'
         '  "rationale": "為何給此分數、依據哪幾個句子（≤ 60 字、繁體中文）",\n'
-        '  "deadline": "ISO8601 或 null"\n'
+        '  "deadline": "ISO8601 或 null",\n'
+        '  "actionability": "concrete" | "vague",\n'
+        '  "purchase_target": { "sku_or_title": "...", "purchase_url": "...", "price_hint": "..." } | null\n'
         "}\n"
         "\n"
         "分數標準：\n"
@@ -131,7 +135,17 @@ def build_classifier_prompt(
         "- 「新弾発売決定」/「ブースター発売」/「拡張パック公開」（Bushiroad / UA / Pokemon Center 公式）\n"
         "    → long_term_score 70-85、若含發售日 arbitrage_score 50-70（為 deadline 留時間）\n"
         "\n"
-        "判斷時請優先看推文是否帶以上 ex-ante 訊號 — 即使商品不在使用者 watchlist，這類訊號仍應給到 60+ 分。"
+        "判斷時請優先看推文是否帶以上 ex-ante 訊號 — 即使商品不在使用者 watchlist，這類訊號仍應給到 60+ 分。\n"
+        "\n"
+        "**actionability 判定（控制是否實際推播給使用者）**：\n"
+        "actionability 必須為 \"concrete\" 當且僅當推文同時包含：\n"
+        "  (a) 具體 SKU 或商品標題；\n"
+        "  (b) 立即可下單／申込的入口（Mercari/Rakuma URL、現正開放中的官方抽選申込 URL、\n"
+        "      再販連結、或附價格的訂購頁）。\n"
+        "否則一律為 \"vague\"。趨勢觀察／公告／新聞／商品介紹頁（無下單入口）／\n"
+        "「新弾発表，敬請期待」這類前置訊號都算 vague。\n"
+        "purchase_target 在 vague 時必為 null；concrete 時填上 SKU/標題、purchase_url、price_hint。\n"
+        "vague 訊號不會推播給使用者，僅入庫做 RAG 累積，故請保守判定 — 寧可 vague。"
     )
 
 
@@ -240,6 +254,9 @@ def classify_sns_signal(
     else:
         deadline_iso = deadline.strip()
 
+    actionability = "concrete" if str(parsed.get("actionability", "")).strip().lower() == "concrete" else "vague"
+    purchase_target_json = _coerce_purchase_target(parsed.get("purchase_target"), actionability)
+
     return SnsPostSignal(
         tweet_id=tweet_id,
         rule_id=rule_id,
@@ -251,6 +268,8 @@ def classify_sns_signal(
         suggested_action=str(parsed.get("suggested_action", "")).strip()[:200],
         rationale=str(parsed.get("rationale", "")).strip()[:300],
         deadline_iso=deadline_iso,
+        actionability=actionability,
+        purchase_target_json=purchase_target_json,
     )
 
 
@@ -261,7 +280,27 @@ def _empty_signal(tweet_id: str, rule_id: str, matched_entities: tuple[str, ...]
         matched_products=(), matched_keywords=(),
         matched_entities=matched_entities,
         suggested_action="", rationale="(分類失敗)", deadline_iso=None,
+        actionability="vague", purchase_target_json=None,
     )
+
+
+def _coerce_purchase_target(value: object, actionability: str) -> str | None:
+    """Keep purchase_target only when actionability=='concrete' and it has a
+    http(s) purchase_url. Anything else collapses to None — silence-first."""
+    if actionability != "concrete" or not isinstance(value, dict):
+        return None
+    url = value.get("purchase_url")
+    if not isinstance(url, str) or not url.strip().lower().startswith(("http://", "https://")):
+        return None
+    cleaned = {
+        "sku_or_title": str(value.get("sku_or_title") or "").strip()[:200],
+        "purchase_url": url.strip()[:500],
+        "price_hint":   str(value.get("price_hint") or "").strip()[:80],
+    }
+    try:
+        return json.dumps(cleaned, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
 
 
 # ── Gate decision helpers ────────────────────────────────────────────────────
@@ -279,11 +318,18 @@ def decide_push_reason(
     Caller pushes iff the return value is not 'none'.
 
     Bypass A: when the rule's own include_keywords matched the tweet, always
-    push regardless of LLM score. This protects the user's hand-set keyword
-    filters — they opted into seeing those phrases, period.
+    push regardless of LLM score or actionability. This protects the user's
+    hand-set keyword filters — they opted into seeing those phrases, period.
+
+    Actionability gate (silence-first): outside Bypass A, only "concrete"
+    signals push — those with a specific SKU + a buy-now surface. Vague
+    trend/announcement chatter is silenced (stored to the knowledge base
+    by the monitor instead). Score gate still applies as a lower bound.
     """
     if keyword_matched:
         return "explicit_keyword"
+    if signal.actionability != "concrete":
+        return "none"
     lt = signal.long_term_score >= min_score
     arb = signal.arbitrage_score >= min_score
     if lt and arb:

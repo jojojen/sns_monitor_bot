@@ -45,6 +45,7 @@ def _make_monitor(*, llm_fn, min_score=60, alias_source=None):
     monitor._entity_extraction_llm_fn = None
     monitor._alias_source = alias_source or _StubAliasSource()
     monitor._knowledge_retriever = None
+    monitor._knowledge_appender = None
     monitor._entity_research_fn = None
     monitor._ip_heat_retriever = None
     monitor._monitor_db_path = None
@@ -171,7 +172,12 @@ def test_keywordless_rule_drops_below_threshold_and_persists_with_pushed_zero():
 
 def test_keywordless_rule_pushes_strong_long_term_signal():
     def llm(_prompt):
-        return '{"long_term_score": 85, "arbitrage_score": 20, "suggested_action": "加入長期 watchlist"}'
+        return (
+            '{"long_term_score": 85, "arbitrage_score": 20, '
+            '"suggested_action": "加入長期 watchlist", "actionability": "concrete", '
+            '"purchase_target": {"sku_or_title": "アビスアイ box", '
+            '"purchase_url": "https://mercari.jp/items/x"}}'
+        )
 
     monitor = _make_monitor(llm_fn=llm, min_score=60)
     rule = _make_account_rule(include_keywords=())
@@ -200,7 +206,12 @@ def test_keywordless_rule_pushes_strong_long_term_signal():
 
 def test_keywordless_rule_pushes_both_signals_when_both_high():
     def llm(_prompt):
-        return '{"long_term_score": 80, "arbitrage_score": 80}'
+        return (
+            '{"long_term_score": 80, "arbitrage_score": 80, '
+            '"actionability": "concrete", '
+            '"purchase_target": {"sku_or_title": "BOX", '
+            '"purchase_url": "https://mercari.jp/items/y"}}'
+        )
 
     monitor = _make_monitor(llm_fn=llm, min_score=60)
     rule = _make_account_rule(include_keywords=())
@@ -246,4 +257,92 @@ def test_keyword_watch_force_bypass_pushes_regardless_of_score():
     assert len(msgs) == 1
     assert "命中你設的篩選關鍵字「アビスアイ box」" in msgs[0]
     record = monitor._db.recorded[0]
+    assert record["bypass_reason"] == "explicit_keyword"
+
+
+# ── Actionability silence → knowledge_appender sink ─────────────────────────
+
+
+def test_silenced_vague_signal_skips_notify_and_calls_appender():
+    """A long-term signal without a buy-now surface (actionability=vague,
+    no Bypass A) must NOT push to Telegram. Instead, it gets sunk into the
+    lobster knowledge base — once per matched entity."""
+    def vague_llm(_prompt):
+        return (
+            '{"long_term_score": 85, "arbitrage_score": 30, '
+            '"suggested_action": "關注發售資訊", '
+            '"rationale": "新弾発表，前置訊號", '
+            '"actionability": "vague"}'
+        )
+
+    monitor = _make_monitor(llm_fn=vague_llm)
+    # Force matched_entities into the classifier output via the alias source.
+    class _Aliases:
+        def all_aliases(self):
+            return [("UNION ARENA", "union_arena")]
+        def lookup_canonical(self, alias):
+            return "union_arena" if alias.lower() == "union arena" else None
+    monitor._alias_source = _Aliases()
+
+    appended: list[dict] = []
+    monitor._knowledge_appender = lambda payload: appended.append(payload)
+
+    notify_calls: list = []
+    monitor._notify_fn = lambda *a, **kw: notify_calls.append(a)
+
+    rule = _make_account_rule(include_keywords=())
+    tweet = _make_tweet("UNION ARENA 新弾発売決定！")
+
+    from sns_monitor.interest_profile import UserInterestProfile
+    delivered: list[str] = []
+    monitor._classify_one_and_maybe_push(
+        rule=rule, tweet=tweet, profile=UserInterestProfile(chat_id="chat-A"),
+        feedback_for_rule={}, footer_counts={},
+        force_bypass_keyword=None, delivered=delivered,
+    )
+
+    assert delivered == [], "vague signal must not push"
+    assert notify_calls == [], "notify_fn must not be called for vague signal"
+    record = monitor._db.recorded[0]
+    assert record["pushed"] == 0
+    assert record["bypass_reason"] == "none"
+    assert len(appended) == 1, f"expected 1 appender call per matched entity, got {appended}"
+    payload = appended[0]
+    assert payload["entity"] == "union_arena"
+    assert payload["rationale"] == "新弾発表，前置訊號"
+    assert payload["suggested_action"] == "關注發售資訊"
+    assert payload["tweet_url"] == "https://x.com/alice/status/t1"
+
+
+def test_bypass_a_still_pushes_when_vague_and_skips_appender():
+    """Bypass A wins over the actionability gate — user-set keyword filter
+    is the authority. The silenced sink should NOT run on a pushed signal."""
+    def vague_llm(_prompt):
+        return (
+            '{"long_term_score": 5, "arbitrage_score": 5, '
+            '"actionability": "vague"}'
+        )
+
+    monitor = _make_monitor(llm_fn=vague_llm)
+    appended: list[dict] = []
+    monitor._knowledge_appender = lambda payload: appended.append(payload)
+    delivered_messages: list[tuple[str, str]] = []
+    monitor._notify_fn = lambda chat_id, text, reply_markup=None: delivered_messages.append((chat_id, text))
+
+    rule = _make_account_rule(include_keywords=("抽選",))
+    tweet = _make_tweet("これは抽選の話")
+
+    from sns_monitor.interest_profile import UserInterestProfile
+    delivered: list[str] = []
+    monitor._classify_one_and_maybe_push(
+        rule=rule, tweet=tweet, profile=UserInterestProfile(chat_id="chat-A"),
+        feedback_for_rule={}, footer_counts={},
+        force_bypass_keyword=None, delivered=delivered,
+    )
+
+    assert delivered == ["t1"], "Bypass A must push even on vague signal"
+    assert len(delivered_messages) == 1
+    assert appended == [], "appender must not run on pushed signal"
+    record = monitor._db.recorded[0]
+    assert record["pushed"] == 1
     assert record["bypass_reason"] == "explicit_keyword"

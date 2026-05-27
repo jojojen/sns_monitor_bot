@@ -197,12 +197,18 @@ def test_classify_propagates_matched_entities_through():
 # ── decide_push_reason (Bypass A guardrail) ─────────────────────────────────
 
 
-def _signal(lt=0, arb=0):
+def _signal(lt=0, arb=0, actionability="concrete", purchase_target_json=None):
+    """Helper for score-gate tests. Defaults to actionability='concrete' so
+    existing tests exercise the score logic (not the actionability gate).
+    The dedicated actionability tests below pass actionability='vague'
+    explicitly."""
     return SnsPostSignal(
         tweet_id="t", rule_id="r",
         long_term_score=lt, arbitrage_score=arb,
         matched_products=(), matched_keywords=(), matched_entities=(),
         suggested_action="", rationale="", deadline_iso=None,
+        actionability=actionability,
+        purchase_target_json=purchase_target_json,
     )
 
 
@@ -280,3 +286,82 @@ def test_classify_sns_signal_passes_heat_block_to_prompt():
     classify_sns_signal(**kwargs)
     assert captured, "LLM was not called"
     assert "percentile=90" in captured[0]
+
+
+# ── actionability gate (silence vague non-keyword signals) ─────────────────
+
+
+def test_prompt_contains_actionability_contract():
+    prompt = build_classifier_prompt(
+        tweet_id="t1", author_handle="x", created_at="2026-05-27",
+        tweet_text="UNION ARENA 新弾発表",
+        watchlist_queries=(), pinned_targets=(),
+        feedback_for_rule={}, knowledge_block="(無)",
+    )
+    assert '"actionability"' in prompt
+    assert '"purchase_target"' in prompt
+    assert "concrete" in prompt and "vague" in prompt
+
+
+def test_parser_defaults_missing_actionability_to_vague():
+    def llm(_prompt):
+        return '{"long_term_score": 80, "arbitrage_score": 20, "deadline": null}'
+    signal = classify_sns_signal(**_make_kwargs(llm_fn=llm))
+    assert signal.actionability == "vague"
+    assert signal.purchase_target_json is None
+
+
+def test_parser_accepts_concrete_with_valid_purchase_target():
+    def llm(_prompt):
+        return (
+            '{"long_term_score": 80, "arbitrage_score": 80, "deadline": null, '
+            '"actionability": "concrete", '
+            '"purchase_target": {"sku_or_title": "UA20BT BOX", '
+            '"purchase_url": "https://mercari.jp/items/m12345", '
+            '"price_hint": "¥5,500"}}'
+        )
+    signal = classify_sns_signal(**_make_kwargs(llm_fn=llm))
+    assert signal.actionability == "concrete"
+    import json as _j
+    pt = _j.loads(signal.purchase_target_json or "{}")
+    assert pt["purchase_url"].startswith("https://mercari.jp/")
+    assert pt["sku_or_title"] == "UA20BT BOX"
+
+
+def test_parser_rejects_purchase_target_when_vague():
+    def llm(_prompt):
+        return (
+            '{"long_term_score": 80, "arbitrage_score": 80, "deadline": null, '
+            '"actionability": "vague", '
+            '"purchase_target": {"purchase_url": "https://example.com"}}'
+        )
+    signal = classify_sns_signal(**_make_kwargs(llm_fn=llm))
+    assert signal.actionability == "vague"
+    assert signal.purchase_target_json is None
+
+
+def test_parser_rejects_purchase_target_without_http_url():
+    def llm(_prompt):
+        return (
+            '{"long_term_score": 80, "arbitrage_score": 80, "deadline": null, '
+            '"actionability": "concrete", '
+            '"purchase_target": {"sku_or_title": "x", "purchase_url": "not-a-url"}}'
+        )
+    signal = classify_sns_signal(**_make_kwargs(llm_fn=llm))
+    assert signal.actionability == "concrete"
+    assert signal.purchase_target_json is None
+
+
+def test_decide_push_reason_silences_vague_non_keyword():
+    sig = _signal(lt=90, arb=20, actionability="vague")
+    assert decide_push_reason(signal=sig, keyword_matched=False) == "none"
+
+
+def test_decide_push_reason_keyword_bypass_overrides_vague():
+    sig = _signal(lt=10, arb=10, actionability="vague")
+    assert decide_push_reason(signal=sig, keyword_matched=True) == "explicit_keyword"
+
+
+def test_decide_push_reason_concrete_still_needs_min_score():
+    sig = _signal(lt=10, arb=10, actionability="concrete")
+    assert decide_push_reason(signal=sig, keyword_matched=False) == "none"
