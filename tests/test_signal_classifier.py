@@ -199,7 +199,7 @@ def test_classify_propagates_matched_entities_through():
 # ── decide_push_reason (Bypass A guardrail) ─────────────────────────────────
 
 
-def _signal(lt=0, arb=0, actionability="concrete", purchase_target_json=None):
+def _signal(lt=0, arb=0, actionability="concrete", purchase_target_json=None, giveaway_spam=False):
     """Helper for score-gate tests. Defaults to actionability='concrete' so
     existing tests exercise the score logic (not the actionability gate).
     The dedicated actionability tests below pass actionability='vague'
@@ -211,7 +211,27 @@ def _signal(lt=0, arb=0, actionability="concrete", purchase_target_json=None):
         suggested_action="", rationale="", deadline_iso=None,
         actionability=actionability,
         purchase_target_json=purchase_target_json,
+        giveaway_spam=giveaway_spam,
     )
+
+
+def test_decide_push_reason_giveaway_spam_overrides_keyword_bypass():
+    """LLM giveaway_spam verdict is the highest-priority gate: a worthless
+    follow+retweet raffle never pushes, even when the rule's include_keyword
+    matched (Bypass A)."""
+    reason = decide_push_reason(
+        signal=_signal(lt=0, arb=0, giveaway_spam=True), keyword_matched=True
+    )
+    assert reason == "giveaway_spam"
+
+
+def test_decide_push_reason_legit_lottery_still_bypasses_on_keyword():
+    """A legit 抽選販売 (giveaway_spam=False) that matched the keyword must
+    still push via Bypass A — the override only fires on the LLM verdict."""
+    reason = decide_push_reason(
+        signal=_signal(lt=0, arb=0, giveaway_spam=False), keyword_matched=True
+    )
+    assert reason == "explicit_keyword"
 
 
 def test_explicit_keyword_bypass_always_wins_even_at_zero_score():

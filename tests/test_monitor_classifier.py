@@ -113,6 +113,44 @@ def test_explicit_keyword_match_always_pushes_even_when_classifier_says_noise():
     assert record["arbitrage_score"] == 0
 
 
+def test_llm_giveaway_spam_verdict_overrides_keyword_bypass():
+    """User set include_keywords=('抽選',) and a follow+retweet raffle mentions
+    '抽選'. Bypass A would normally force a push — but when the LLM judges the
+    post a worthless follow+retweet giveaway (giveaway_spam=true), that verdict
+    overrides Bypass A: nothing is delivered and bypass_reason='giveaway_spam'
+    is recorded for observability."""
+    def giveaway_llm(_prompt):
+        return (
+            '{"long_term_score": 0, "arbitrage_score": 0, '
+            '"giveaway_spam": true, "rationale": "フォロー+リポスト無償抽選"}'
+        )
+
+    delivered_messages: list[tuple[str, str]] = []
+    monitor = _make_monitor(llm_fn=giveaway_llm)
+    monitor._notify_fn = lambda chat_id, text, reply_markup=None: delivered_messages.append((chat_id, text))
+
+    rule = _make_account_rule(include_keywords=("抽選",))
+    tweet = _make_tweet(
+        "本日のプレゼント企画\n参加条件\n① @shop をフォロー\n② リポスト\n完売後に抽選"
+    )
+
+    from sns_monitor.interest_profile import UserInterestProfile
+    profile = UserInterestProfile(chat_id="chat-A")
+    delivered: list[str] = []
+    monitor._classify_one_and_maybe_push(
+        rule=rule, tweet=tweet, profile=profile,
+        feedback_for_rule={}, footer_counts={},
+        force_bypass_keyword=None,
+        delivered=delivered,
+    )
+
+    assert delivered == [], "follow+retweet giveaway must not be pushed"
+    assert delivered_messages == []
+    record = monitor._db.recorded[0]
+    assert record["bypass_reason"] == "giveaway_spam"
+    assert record["pushed"] == 0
+
+
 def test_explicit_keyword_bypass_still_runs_classifier_for_record():
     """Bypass A skips the gate, not the classifier. Score must still be stored
     so /digest / future tuning has data."""

@@ -37,6 +37,7 @@ class SnsPostSignal:
     deadline_iso: str | None            # ISO8601 if extractable, else None
     actionability: str = "vague"        # "concrete" | "vague" — silence-first default
     purchase_target_json: str | None = None  # JSON {sku_or_title, purchase_url, price_hint} when concrete
+    giveaway_spam: bool = False         # follow+retweet 無償抽獎 raffle — worthless, drop even on keyword match
 
 
 # Score thresholds — kept here so tests can override without re-deploying.
@@ -121,6 +122,7 @@ def build_classifier_prompt(
         '  "rationale": "為何給此分數、依據哪幾個句子（≤ 60 字、繁體中文）",\n'
         '  "deadline": "ISO8601 或 null",\n'
         '  "actionability": "concrete" | "vague",\n'
+        '  "giveaway_spam": true | false,\n'
         '  "purchase_target": { "sku_or_title": "...", "purchase_url": "...", "price_hint": "..." } | null\n'
         "}\n"
         "\n"
@@ -153,7 +155,22 @@ def build_classifier_prompt(
         "否則一律為 \"vague\"。趨勢觀察／公告／新聞／商品介紹頁（無下單入口）／\n"
         "「新弾発表，敬請期待」這類前置訊號都算 vague。\n"
         "purchase_target 在 vague 時必為 null；concrete 時填上 SKU/標題、purchase_url、price_hint。\n"
-        "vague 訊號不會推播給使用者，僅入庫做 RAG 累積，故請保守判定 — 寧可 vague。"
+        "vague 訊號不會推播給使用者，僅入庫做 RAG 累積，故請保守判定 — 寧可 vague。\n"
+        "\n"
+        "**giveaway_spam 判定（過濾中獎機率趨近於零、對使用者無價值的抽獎）**：\n"
+        "核心判準＝中獎／取得機率是否趨近於零，且對使用者沒有實際可取得或可購買的價值。\n"
+        "giveaway_spam = true：典型為大量轉推型『無償プレゼント企画 / 無料配布 / オリパ無料抽選』—\n"
+        "任何人靠「フォロー＋リポスト（リツイート/引用）／リプ／免費應募」就能參加，動輒上萬轉推搶 1 份免費獎品，\n"
+        "中獎率趨近於零；且主辦多為養粉 farming 帳號，根本無法確認是否真的會開獎/兌獎，可信度低，\n"
+        "就算中了也沒有可購買的套利標的，對使用者無價值。判斷依語意不是單一字詞，\n"
+        "改寫、emoji、不同說法（拡散希望 / 引リツ / フォロバ / GIVEAWAY / リプで応募 等）都算；\n"
+        "重點是『免費＋海量參加＝機率趨近於零』，而非是否出現轉推這個動作本身。\n"
+        "**giveaway_spam = false（不可誤刪）**：正當且實際可取得的機會 — 中選者需『付費購買』商品的店家/官方抽選，\n"
+        "包含『抽選販売 / 抽選申込 / 予約抽選 / 店頭抽選』，以及透過 Livepocket（t.livepocket.jp）、L-tike、\n"
+        "官網或店鋪申込フォーム 進行、當選後需入金/購入/店頭受取 的抽選。這類限量、申込制，中籤率遠高於海量免費抽，\n"
+        "且是以定價買到實體商品的正當管道；即使同時要求フォロー＆RT，只要最終付費買到商品，一律 false。\n"
+        "grounding：若上方知識庫參考或本 rule 的 👎 feedback 顯示此類無償抽獎已被使用者多次拒絕，請更傾向判 true。\n"
+        "當 giveaway_spam = true 時，long_term_score 與 arbitrage_score 一律給 0。"
     )
 
 
@@ -264,6 +281,7 @@ def classify_sns_signal(
 
     actionability = "concrete" if str(parsed.get("actionability", "")).strip().lower() == "concrete" else "vague"
     purchase_target_json = _coerce_purchase_target(parsed.get("purchase_target"), actionability)
+    giveaway_spam = _coerce_bool(parsed.get("giveaway_spam"))
 
     return SnsPostSignal(
         tweet_id=tweet_id,
@@ -278,7 +296,18 @@ def classify_sns_signal(
         deadline_iso=deadline_iso,
         actionability=actionability,
         purchase_target_json=purchase_target_json,
+        giveaway_spam=giveaway_spam,
     )
+
+
+def _coerce_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    if isinstance(value, (int, float)):
+        return value != 0
+    return False
 
 
 def _empty_signal(tweet_id: str, rule_id: str, matched_entities: tuple[str, ...]) -> SnsPostSignal:
@@ -344,8 +373,15 @@ def decide_push_reason(
 ) -> str:
     """Return the bypass_reason that determines whether the monitor pushes.
 
-    Values: 'explicit_keyword' / 'both' / 'long_term' / 'arbitrage' / 'none'.
-    Caller pushes iff the return value is not 'none'.
+    Values: 'giveaway_spam' / 'explicit_keyword' / 'both' / 'long_term' /
+    'arbitrage' / 'none'. Caller pushes iff the return value is none of
+    {'none', 'giveaway_spam'}.
+
+    Giveaway-spam override (highest priority): when the LLM judged the post a
+    worthless follow+retweet raffle (``signal.giveaway_spam``), never push —
+    even if the rule's include_keyword matched. These have near-zero odds and
+    no buyable item, so they override Bypass A. Recorded as 'giveaway_spam'
+    for observability rather than silently collapsing to 'none'.
 
     Bypass A: when the rule's own include_keywords matched the tweet, always
     push regardless of LLM score or actionability. This protects the user's
@@ -361,6 +397,8 @@ def decide_push_reason(
     probability of similar concrete tweets. Does not affect Bypass A or the
     actionability gate.
     """
+    if signal.giveaway_spam:
+        return "giveaway_spam"
     if keyword_matched:
         return "explicit_keyword"
     if signal.actionability != "concrete":

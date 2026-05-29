@@ -513,7 +513,7 @@ class SnsMonitor:
             min_score=self._min_score_to_push,
             feedback_for_rule=feedback_for_rule,
         )
-        should_push = reason != "none"
+        should_push = reason not in ("none", "giveaway_spam")
 
         try:
             self._db.record_sns_signal(
@@ -536,7 +536,7 @@ class SnsMonitor:
             )
 
         if not should_push:
-            if self._knowledge_appender is not None and signal.matched_entities:
+            if reason != "giveaway_spam" and self._knowledge_appender is not None and signal.matched_entities:
                 observed_at = tweet.created_at.isoformat()
                 tweet_url = f"https://x.com/{tweet.author_handle}/status/{tweet.tweet_id}"
                 for ent in signal.matched_entities:
