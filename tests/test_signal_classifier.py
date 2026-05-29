@@ -11,9 +11,11 @@ from __future__ import annotations
 
 from sns_monitor.signal_classifier import (
     DEFAULT_MIN_SCORE_TO_PUSH,
+    FEEDBACK_SCORE_FLOOR,
     SnsPostSignal,
     _clamp_score,
     _coerce_str_list,
+    _effective_min_score,
     _parse_classifier_response,
     build_classifier_prompt,
     classify_sns_signal,
@@ -243,6 +245,59 @@ def test_decide_push_reason_respects_custom_threshold():
     sig = _signal(lt=40, arb=40)
     assert decide_push_reason(signal=sig, keyword_matched=False, min_score=DEFAULT_MIN_SCORE_TO_PUSH) == "none"
     assert decide_push_reason(signal=sig, keyword_matched=False, min_score=30) == "both"
+
+
+# ── feedback push-probability boost ─────────────────────────────────────────
+
+
+def test_effective_min_score_no_feedback_is_unchanged():
+    assert _effective_min_score(60, None) == 60
+    assert _effective_min_score(60, {}) == 60
+
+
+def test_effective_min_score_bought_lowers_threshold():
+    assert _effective_min_score(60, {"bought": 1}) == 55
+    assert _effective_min_score(60, {"bought": 2}) == 50
+
+
+def test_effective_min_score_up_lowers_threshold():
+    assert _effective_min_score(60, {"up": 3}) == 54
+
+
+def test_effective_min_score_floored_at_50():
+    # Large positive feedback can't push the gate below the floor (50).
+    assert _effective_min_score(60, {"up": 5, "bought": 2}) == FEEDBACK_SCORE_FLOOR
+    assert _effective_min_score(60, {"bought": 10}) == FEEDBACK_SCORE_FLOOR
+
+
+def test_effective_min_score_ignores_down():
+    assert _effective_min_score(60, {"down": 9}) == 60
+
+
+def test_decide_push_reason_feedback_surfaces_borderline_tweet():
+    # Score 52 is below the default 60 gate → dropped without feedback…
+    sig = _signal(lt=52, arb=0)
+    assert decide_push_reason(signal=sig, keyword_matched=False) == "none"
+    # …but two 💰 lower the gate to 50, so it now pushes.
+    assert decide_push_reason(
+        signal=sig, keyword_matched=False, feedback_for_rule={"bought": 2},
+    ) == "long_term"
+
+
+def test_decide_push_reason_feedback_never_surfaces_below_floor():
+    # Score 45 stays below the 50 floor regardless of feedback magnitude.
+    sig = _signal(lt=45, arb=45)
+    assert decide_push_reason(
+        signal=sig, keyword_matched=False, feedback_for_rule={"bought": 10},
+    ) == "none"
+
+
+def test_decide_push_reason_feedback_does_not_override_actionability():
+    # Vague signals never push, even with heavy positive feedback.
+    sig = _signal(lt=90, arb=90, actionability="vague")
+    assert decide_push_reason(
+        signal=sig, keyword_matched=False, feedback_for_rule={"bought": 5},
+    ) == "none"
 
 
 # ── heat_block injection ─────────────────────────────────────────────────────

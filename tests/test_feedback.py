@@ -82,42 +82,25 @@ def test_up_feedback_records_only(tmp_path: Path) -> None:
     assert refreshed.enabled is True
 
 
-# ── 💰 bought: halve schedule (floor 15) ────────────────────────────────────
+# ── 💰 bought: record only, no schedule change ──────────────────────────────
 
 
-def test_bought_feedback_halves_schedule(tmp_path: Path) -> None:
+def test_bought_feedback_records_only_no_schedule_change(tmp_path: Path) -> None:
     db = _make_db(tmp_path)
     db.save_watch_rule(_account_watch(schedule_minutes=120))
 
     result = record_sns_feedback(
         db=db, tweet_id="t1", rule_id="rule_a", chat_id="123", kind="bought",
     )
-    assert "rule_schedule_shortened" in result["side_effects"]
-    assert result["new_schedule_minutes"] == 60
-    assert db.get_watch_rule("rule_a").schedule_minutes == 60
-
-
-def test_bought_feedback_floors_at_15(tmp_path: Path) -> None:
-    db = _make_db(tmp_path)
-    db.save_watch_rule(_account_watch(schedule_minutes=20))
-
-    record_sns_feedback(
-        db=db, tweet_id="t1", rule_id="rule_a", chat_id="123", kind="bought",
-    )
-    # 20 // 2 = 10 → clamped to 15
-    assert db.get_watch_rule("rule_a").schedule_minutes == 15
-
-
-def test_bought_feedback_at_floor_no_side_effect(tmp_path: Path) -> None:
-    db = _make_db(tmp_path)
-    db.save_watch_rule(_account_watch(schedule_minutes=15))
-
-    result = record_sns_feedback(
-        db=db, tweet_id="t1", rule_id="rule_a", chat_id="123", kind="bought",
-    )
-    # Schedule already at 15 → no shortening
-    assert "rule_schedule_shortened" not in result["side_effects"]
-    assert db.get_watch_rule("rule_a").schedule_minutes == 15
+    assert result["status"] == "ok"
+    assert result["side_effects"] == []
+    assert "new_schedule_minutes" not in result
+    # Scan frequency must be untouched — bought now raises push probability,
+    # not poll cadence.
+    assert db.get_watch_rule("rule_a").schedule_minutes == 120
+    # Per-post row still written (feeds the 30-day push-probability boost).
+    row = _row(db, "SELECT * FROM sns_post_feedback WHERE tweet_id = ?", ("t1",))
+    assert row is not None and row["feedback_kind"] == "bought"
 
 
 # ── 👎 down: cooldown → auto-disable ─────────────────────────────────────────

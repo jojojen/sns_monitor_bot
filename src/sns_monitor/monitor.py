@@ -511,6 +511,7 @@ class SnsMonitor:
             signal=signal,
             keyword_matched=keyword_matched,
             min_score=self._min_score_to_push,
+            feedback_for_rule=feedback_for_rule,
         )
         should_push = reason != "none"
 

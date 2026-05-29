@@ -42,6 +42,14 @@ class SnsPostSignal:
 # Score thresholds — kept here so tests can override without re-deploying.
 DEFAULT_MIN_SCORE_TO_PUSH: int = 60
 
+# Positive feedback lowers the push threshold for a rule (raises push
+# probability of similar future tweets) instead of changing scan frequency.
+# Conservative: 👍 -2, 💰 -5 per occurrence (30-day aggregate), floored at 50
+# so noise (<50) is never surfaced. Explicit-keyword bypass is unaffected.
+FEEDBACK_SCORE_FLOOR: int = 50
+FEEDBACK_BOOST_PER_UP: int = 2
+FEEDBACK_BOOST_PER_BOUGHT: int = 5
+
 
 def build_classifier_prompt(
     *,
@@ -306,11 +314,33 @@ def _coerce_purchase_target(value: object, actionability: str) -> str | None:
 # ── Gate decision helpers ────────────────────────────────────────────────────
 
 
+def _effective_min_score(
+    min_score: int,
+    feedback_for_rule: Mapping[str, int] | None,
+    score_floor: int = FEEDBACK_SCORE_FLOOR,
+) -> int:
+    """Lower the push threshold based on a rule's positive feedback.
+
+    Conservative boost: 👍 -2, 💰 -5 per 30-day occurrence, floored at
+    ``score_floor`` (default 50). 👎 does not raise the threshold here (it
+    drives cooldown/auto-disable elsewhere)."""
+    fb = feedback_for_rule or {}
+    boost = (
+        int(fb.get("up", 0)) * FEEDBACK_BOOST_PER_UP
+        + int(fb.get("bought", 0)) * FEEDBACK_BOOST_PER_BOUGHT
+    )
+    # The floor only clamps the boost; it must never raise a caller's own
+    # threshold that is already below the floor.
+    floor = min(score_floor, min_score)
+    return max(floor, min_score - boost)
+
+
 def decide_push_reason(
     *,
     signal: SnsPostSignal,
     keyword_matched: bool,
     min_score: int = DEFAULT_MIN_SCORE_TO_PUSH,
+    feedback_for_rule: Mapping[str, int] | None = None,
 ) -> str:
     """Return the bypass_reason that determines whether the monitor pushes.
 
@@ -325,13 +355,19 @@ def decide_push_reason(
     signals push — those with a specific SKU + a buy-now surface. Vague
     trend/announcement chatter is silenced (stored to the knowledge base
     by the monitor instead). Score gate still applies as a lower bound.
+
+    Feedback boost: positive feedback on this rule (``feedback_for_rule``)
+    lowers the score gate (down to FEEDBACK_SCORE_FLOOR), raising the push
+    probability of similar concrete tweets. Does not affect Bypass A or the
+    actionability gate.
     """
     if keyword_matched:
         return "explicit_keyword"
     if signal.actionability != "concrete":
         return "none"
-    lt = signal.long_term_score >= min_score
-    arb = signal.arbitrage_score >= min_score
+    effective_min = _effective_min_score(min_score, feedback_for_rule)
+    lt = signal.long_term_score >= effective_min
+    arb = signal.arbitrage_score >= effective_min
     if lt and arb:
         return "both"
     if lt:
