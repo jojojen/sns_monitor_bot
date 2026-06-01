@@ -33,6 +33,8 @@ class SnsDatabase:
     def connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(str(self.path))
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         try:
             yield conn
         finally:
@@ -160,6 +162,27 @@ class SnsDatabase:
                     first_seen_at        TEXT NOT NULL,
                     last_updated_at      TEXT NOT NULL
                 );
+
+                -- Day-before reminders for IP-collab limited events. A single
+                -- event signal can spawn up to two rows: kind='signup' (one day
+                -- before the application/ticket deadline) and kind='event' (one
+                -- day before the event itself). kind is part of reminder_id so
+                -- both coexist and dedup independently. payload_text holds the
+                -- fully-rendered body so the reminder survives restarts.
+                CREATE TABLE IF NOT EXISTS scheduled_reminders (
+                    reminder_id  TEXT PRIMARY KEY,     -- f"{tweet_id}:{rule_id}:{kind}"
+                    chat_id      TEXT NOT NULL,
+                    rule_id      TEXT NOT NULL,
+                    tweet_id     TEXT NOT NULL,
+                    kind         TEXT NOT NULL,         -- 'signup' | 'event'
+                    target_date  TEXT NOT NULL,         -- ISO8601 deadline or event date
+                    remind_at    TEXT NOT NULL,         -- ISO8601, target_date - 24h
+                    payload_text TEXT NOT NULL,
+                    sent         INTEGER NOT NULL DEFAULT 0,
+                    created_at   TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_scheduled_reminders_due
+                    ON scheduled_reminders(sent, remind_at);
                 """
             )
             # Idempotent ALTER TABLE for older DBs.
@@ -725,6 +748,55 @@ class SnsDatabase:
                 (int(min_score), int(min_score), int(limit)),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def create_reminder(
+        self,
+        *,
+        chat_id: str,
+        rule_id: str,
+        tweet_id: str,
+        kind: str,
+        target_date: str,
+        remind_at: str,
+        payload_text: str,
+    ) -> bool:
+        """Schedule a day-before reminder. Dedups on (tweet_id, rule_id, kind)
+        via reminder_id, so re-classifying the same tweet won't pile up
+        duplicate reminders. Returns True if a new row was inserted."""
+        reminder_id = f"{tweet_id}:{rule_id}:{kind}"
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO scheduled_reminders
+                (reminder_id, chat_id, rule_id, tweet_id, kind, target_date,
+                 remind_at, payload_text, sent, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                """,
+                (
+                    reminder_id, chat_id, rule_id, tweet_id, kind,
+                    target_date, remind_at, payload_text, utc_now().isoformat(),
+                ),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def list_due_reminders(self, now_iso: str) -> list[dict[str, object]]:
+        """Unsent reminders whose remind_at has arrived (<= now)."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scheduled_reminders "
+                "WHERE sent = 0 AND remind_at <= ? ORDER BY remind_at",
+                (now_iso,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_reminder_sent(self, reminder_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE scheduled_reminders SET sent = 1 WHERE reminder_id = ?",
+                (reminder_id,),
+            )
+            conn.commit()
 
     def record_tweets(self, rule_id: str, tweets: list[Tweet]) -> list[Tweet]:
         """Insert tweets and return only newly seen ones. First check marks all as notified."""
