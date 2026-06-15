@@ -180,6 +180,74 @@ def split_source_prefix(raw: str) -> tuple[str, str]:
     return "x", raw
 
 
+# Hosts whose first path segment is an account handle (X/Twitter family and
+# Nitter mirrors). Reddit is handled separately (its r/<sub> path keeps the
+# `r/` segment so the subreddit parser matches).
+_X_URL_HOSTS: frozenset[str] = frozenset({
+    "x.com", "twitter.com", "mobile.twitter.com", "mobile.x.com",
+    "fxtwitter.com", "vxtwitter.com", "fixupx.com", "nitter.net",
+})
+# X paths that are site features, not accounts — never rewrite these.
+_X_RESERVED_SEGMENTS: frozenset[str] = frozenset({
+    "i", "home", "search", "hashtag", "explore", "notifications",
+    "messages", "settings", "compose", "intent", "share", "login",
+})
+_REDDIT_URL_HOSTS: frozenset[str] = frozenset({
+    "reddit.com", "old.reddit.com", "np.reddit.com", "new.reddit.com",
+})
+
+
+def rewrite_social_url(raw: str) -> str:
+    """Rewrite a pasted profile URL into the bare command form the parsers
+    expect, leaving any trailing filter/domain/schedule tokens untouched.
+
+    ``https://x.com/pcgl_shibuya?s=21`` → ``@pcgl_shibuya`` and
+    ``https://www.reddit.com/r/PokemonTCG/`` → ``reddit:r/PokemonTCG``. Input
+    that isn't a recognised profile URL is returned unchanged, so existing
+    ``@handle`` / ``reddit:r/sub`` / ``keyword:`` forms keep working.
+    """
+    from urllib.parse import urlsplit
+
+    cleaned = raw.strip()
+    if not cleaned:
+        return raw
+    parts = cleaned.split(None, 1)
+    token = parts[0]
+    rest = parts[1] if len(parts) > 1 else ""
+
+    candidate = token
+    if "://" not in candidate:
+        host_head = candidate.split("/", 1)[0].lower()
+        if "." in host_head and ("/" in candidate or host_head in _X_URL_HOSTS):
+            candidate = "https://" + candidate
+        else:
+            return raw
+
+    try:
+        split = urlsplit(candidate)
+    except ValueError:
+        return raw
+    if split.scheme not in ("http", "https") or not split.netloc:
+        return raw
+    host = split.netloc.lower().split("@")[-1].split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    segments = [seg for seg in split.path.split("/") if seg]
+
+    if host in _X_URL_HOSTS:
+        if not segments or segments[0].lower() in _X_RESERVED_SEGMENTS:
+            return raw
+        handle = segments[0]
+        return f"@{handle} {rest}".strip()
+
+    if host in _REDDIT_URL_HOSTS:
+        if len(segments) >= 2 and segments[0].lower() == "r":
+            return f"reddit:r/{segments[1]} {rest}".strip()
+        return raw
+
+    return raw
+
+
 def extract_schedule_minutes(raw: str) -> tuple[int | None, str]:
     """Pull a ``schedule:NN`` token out of *raw* and return (NN, cleaned_raw).
 

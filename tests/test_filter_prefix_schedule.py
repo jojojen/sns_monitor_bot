@@ -5,6 +5,7 @@ from __future__ import annotations
 from sns_monitor.filters import (
     extract_schedule_minutes,
     parse_account_watch_text,
+    rewrite_social_url,
     split_source_prefix,
 )
 
@@ -95,3 +96,55 @@ def test_parse_account_watch_text_still_handles_at_handle() -> None:
     result = parse_account_watch_text("@elonmusk")
     assert result is not None
     assert result[0] == "elonmusk"
+
+
+# ── rewrite_social_url ───────────────────────────────────────────────────────
+
+
+def test_rewrite_x_url_with_share_query() -> None:
+    # The reported case: pasted profile URL with the ?s=NN share suffix.
+    assert rewrite_social_url("https://x.com/pcgl_shibuya?s=21") == "@pcgl_shibuya"
+
+
+def test_rewrite_x_url_full_pipeline_resolves_handle() -> None:
+    out = rewrite_social_url("https://x.com/pcgl_shibuya?s=21")
+    source, body = split_source_prefix(out)
+    assert source == "x"
+    result = parse_account_watch_text(body)
+    assert result is not None and result[0] == "pcgl_shibuya"
+
+
+def test_rewrite_twitter_and_nitter_and_status_url() -> None:
+    assert rewrite_social_url("https://twitter.com/elonmusk") == "@elonmusk"
+    assert rewrite_social_url("https://nitter.net/elonmusk") == "@elonmusk"
+    # A status/tweet URL still resolves to the author handle (first segment).
+    assert rewrite_social_url("https://x.com/jack/status/20") == "@jack"
+
+
+def test_rewrite_x_url_preserves_trailing_tokens() -> None:
+    out = rewrite_social_url("https://x.com/foo?s=21 filter[抽選] domain[pokemon] schedule:30")
+    assert out == "@foo filter[抽選] domain[pokemon] schedule:30"
+
+
+def test_rewrite_schemeless_url() -> None:
+    assert rewrite_social_url("x.com/pcgl_shibuya") == "@pcgl_shibuya"
+
+
+def test_rewrite_reddit_url_to_prefix_form() -> None:
+    assert rewrite_social_url("https://www.reddit.com/r/PokemonTCG/") == "reddit:r/PokemonTCG"
+    out = rewrite_social_url("https://old.reddit.com/r/yugioh domain[ygo]")
+    assert out == "reddit:r/yugioh domain[ygo]"
+
+
+def test_rewrite_ignores_reserved_x_paths() -> None:
+    # Feature paths are not accounts → left unchanged so they fall through.
+    assert rewrite_social_url("https://x.com/search?q=foo") == "https://x.com/search?q=foo"
+    assert rewrite_social_url("https://x.com/i/lists/123") == "https://x.com/i/lists/123"
+
+
+def test_rewrite_passes_through_non_url_forms() -> None:
+    # Existing command forms must be untouched.
+    assert rewrite_social_url("@elonmusk") == "@elonmusk"
+    assert rewrite_social_url("x:keyword:foo") == "x:keyword:foo"
+    assert rewrite_social_url("reddit:r/PokemonTCG") == "reddit:r/PokemonTCG"
+    assert rewrite_social_url("keyword:機動戰士 domain[gundam]") == "keyword:機動戰士 domain[gundam]"
