@@ -7,7 +7,7 @@ features (explicit keyword filter + marketplace watchlist) — see the plan's
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sns_monitor.models import AccountWatch, Tweet
 from sns_monitor.monitor import SnsMonitor
@@ -384,3 +384,80 @@ def test_bypass_a_still_pushes_when_vague_and_skips_appender():
     record = monitor._db.recorded[0]
     assert record["pushed"] == 1
     assert record["bypass_reason"] == "explicit_keyword"
+
+
+def test_event_signal_end_to_end_pushes_with_event_headline_and_schedules_reminders(tmp_path):
+    """Real DB integration: event push uses the event headline, persists two
+    due reminders, then due-check delivery sends them and marks them sent."""
+    import asyncio
+
+    from sns_monitor.interest_profile import UserInterestProfile
+    from sns_monitor.models import utc_now
+    from sns_monitor.storage import SnsDatabase
+
+    now = utc_now()
+    deadline = (now + timedelta(hours=2)).replace(microsecond=0).isoformat()
+    event_date = (now + timedelta(hours=3)).replace(microsecond=0).isoformat()
+
+    def llm(_prompt):
+        return (
+            '{"long_term_score": 0, "arbitrage_score": 0, '
+            '"actionability": "vague", '
+            '"is_event_signal": true, '
+            '"event_name": "Project SEKAI x Lawson", '
+            f'"event_date": "{event_date}", '
+            '"event_location": "日本", '
+            '"signup_url": "https://lawson.example/apply", '
+            '"recommended_character": "巡音ルカ", '
+            f'"deadline": "{deadline}", '
+            '"rationale": "限定聯名公告"}'
+        )
+
+    sent: list[tuple[str, str]] = []
+
+    def notify(chat_id, text, *args):
+        sent.append((chat_id, text))
+
+    db_path = tmp_path / "sns.sqlite3"
+    SnsDatabase(db_path).bootstrap()
+    monitor = SnsMonitor(
+        db_path=str(db_path),
+        notify_fn=notify,
+        sources={},
+        classifier_llm_fn=llm,
+        alias_source=_StubAliasSource(),
+        min_score_to_push=60,
+    )
+    rule = _make_account_rule()
+    tweet = _make_tweet("Project SEKAI x Lawson 限定アクスタ 抽選受付開始")
+
+    monitor._classify_one_and_maybe_push(
+        rule=rule,
+        tweet=tweet,
+        profile=UserInterestProfile(chat_id="chat-A"),
+        feedback_for_rule={},
+        footer_counts={},
+        force_bypass_keyword=None,
+        delivered=[],
+    )
+
+    assert len(sent) == 1
+    initial_text = sent[0][1]
+    assert "📅 限定活動訊號" in initial_text
+    assert "活動：Project SEKAI x Lawson" in initial_text
+    assert "🎯 推薦角色：巡音ルカ" in initial_text
+
+    db = SnsDatabase(db_path)
+    due = db.list_due_reminders(utc_now().isoformat())
+    kinds = {row["kind"] for row in due}
+    assert kinds == {"signup", "event"}
+    for row in due:
+        assert "📅 限定活動訊號" in str(row["payload_text"])
+
+    asyncio.run(monitor._check_due_reminders())
+
+    assert len(sent) == 3
+    reminder_texts = [text for _chat_id, text in sent[1:]]
+    assert any(text.startswith("⏰ 報名前提醒\n\n📅 限定活動訊號") for text in reminder_texts)
+    assert any(text.startswith("⏰ 活動前提醒\n\n📅 限定活動訊號") for text in reminder_texts)
+    assert db.list_due_reminders(utc_now().isoformat()) == []

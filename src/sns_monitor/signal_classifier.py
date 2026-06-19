@@ -38,6 +38,12 @@ class SnsPostSignal:
     actionability: str = "vague"        # "concrete" | "vague" — silence-first default
     purchase_target_json: str | None = None  # JSON {sku_or_title, purchase_url, price_hint} when concrete
     giveaway_spam: bool = False         # follow+retweet 無償抽獎 raffle — worthless, drop even on keyword match
+    is_event_signal: bool = False       # limited IP event/collab announcement — push even at announce stage
+    event_name: str = ""                # 活動名稱
+    event_date: str = ""                # 時間: ISO8601 event/sale start when derivable, else free text/""
+    event_location: str = ""            # 地點
+    signup_url: str = ""                # 報名連結: application/ticket/前売券 URL when advance purchase needed
+    recommended_character: str = ""     # 目標商品（角色）: hot character or target 限定商品 to buy; "" when uncertain
 
 
 # Score thresholds — kept here so tests can override without re-deploying.
@@ -100,7 +106,7 @@ def build_classifier_prompt(
         f"{knowledge_block}\n"
         "\n"
         + (
-            "IP 熱度指標（最新，跨 X mention / Reddit / Google Trends 的 30 日 percentile）：\n"
+            "IP 熱度指標（最新，跨 X mention / 4chan / Google Trends 的 30 日 percentile）：\n"
             f"{heat_block}\n"
             "（percentile ≥ 70 = 近期熱度明顯高於歷史均值，可對 long_term_score 加成 +5~+15）\n"
             "\n"
@@ -123,6 +129,12 @@ def build_classifier_prompt(
         '  "deadline": "ISO8601 或 null",\n'
         '  "actionability": "concrete" | "vague",\n'
         '  "giveaway_spam": true | false,\n'
+        '  "is_event_signal": true | false,\n'
+        '  "event_name": "活動名稱 或 null",\n'
+        '  "event_date": "ISO8601（活動/開賣開始日）或 原文時間字串 或 null",\n'
+        '  "event_location": "地點 或 null",\n'
+        '  "signup_url": "報名/購票/前売券 URL 或 null",\n'
+        '  "recommended_character": "建議入手的熱門角色或限定商品；不確定填 null",\n'
         '  "purchase_target": { "sku_or_title": "...", "purchase_url": "...", "price_hint": "..." } | null\n'
         "}\n"
         "\n"
@@ -170,19 +182,59 @@ def build_classifier_prompt(
         "官網或店鋪申込フォーム 進行、當選後需入金/購入/店頭受取 的抽選。這類限量、申込制，中籤率遠高於海量免費抽，\n"
         "且是以定價買到實體商品的正當管道；即使同時要求フォロー＆RT，只要最終付費買到商品，一律 false。\n"
         "grounding：若上方知識庫參考或本 rule 的 👎 feedback 顯示此類無償抽獎已被使用者多次拒絕，請更傾向判 true。\n"
-        "當 giveaway_spam = true 時，long_term_score 與 arbitrage_score 一律給 0。"
+        "當 giveaway_spam = true 時，long_term_score 與 arbitrage_score 一律給 0。\n"
+        "\n"
+        "**is_event_signal 判定（IP 限定活動／聯名 公告 — 即使尚無購買連結也要推播）**：\n"
+        "is_event_signal = true 的條件（必須同時滿足）：\n"
+        "① 推文是某 IP 的『限定活動或限定聯名商品公告』，包含但不限於：\n"
+        "  IP×店舗/コンビニ コラボ（例：プロセカ × Lawson）、限定アクスタ/グッズ 抽選・発売、\n"
+        "  展覧会/原画展（例：名探偵プリキュア！展）、コラボカフェ、来場特典つきイベント、限定物販。\n"
+        "② **地理限制（硬性條件）：活動地點必須在『日本』或『台灣』。**\n"
+        "  非日本/台灣的活動（如美國 Costco、歐洲發行、英語圈 drop 等）→ is_event_signal = false。\n"
+        "  判斷依據：event_location 中的地名、店名（Lawson/セブン/ローソン → 日本；全家/誠品 → 台灣；Costco USA/Target/Amazon.com → 非日台）、\n"
+        "  或推文語言/帳號地區暗示（英語 Costco drop 通知 → 美國 → false）。\n"
+        "  若地點不明但推文為日語且明顯是日本市場活動 → 視為日本（true）。\n"
+        "這類『公告階段』即使還沒有立即下單連結，也要 is_event_signal = true（讓使用者提早準備）。\n"
+        "保守：單純趨勢閒聊／一般新聞／非限定的常規商品／非日台地區活動 → 不是 event signal。\n"
+        "\n"
+        "**與 giveaway_spam 的界線（重要，不可混淆）**：付費入場特典／来場特典／前売券・有料チケット\n"
+        "的活動（需付費、有實體會場與日期、且有可購買的限定商品）＝付費即可取得的真實價值，屬於 EVENT\n"
+        "（is_event_signal = true、giveaway_spam = false），不是 spam。沿用上面的判準：趨近零機率＋無價值\n"
+        "＋無法驗證主辦 才算 spam；付費活動正好相反。giveaway_spam 仍最優先，但不可吞掉付費／有實際價值的活動。\n"
+        "\n"
+        "**事件欄位抽取（只在推文出現時填，否則 null）**：\n"
+        "- event_name：活動／展／聯名 的名稱。\n"
+        "- event_date：活動或開賣的『開始日』，僅取自推文內文（會期區間取開始日，例『2026年5月15日〜6月7日』→ 2026-05-15），能轉 ISO8601 就轉。\n"
+        "  ⚠️ 嚴禁把上方『時間：…UTC』那行（那是貼文發佈時間，不是活動日期）填進 event_date。內文若沒有明確活動日期（例『6月中旬』『後日発表』『日期未定』）→ 填 null，不要臆造、不要拿發文時間頂替。\n"
+        "- event_location：會場／店鋪／地區。\n"
+        "- signup_url：申込／抽選申込／購票／前売券 的 URL。\n"
+        "\n"
+        "**recommended_character（目標商品／角色，建議入手哪個）**：\n"
+        "推薦『最值得轉售／最熱門、可購買的限定販售商品』——亦即 会場限定/イベント限定/コラボ限定 商品中\n"
+        "最熱門角色的款式。判斷依據＝上方知識庫參考 + 推文本身內容（不得硬背清單）。\n"
+        "目標是『可購買的限定商品』；免費贈品／ランダム配布／来場特典 只是附帶，絕不是轉售標的，不要當作推薦目標。\n"
+        "若該活動的限定商品不分角色（例：展覧会的『会場限定グッズ』『展場限定商品』整批）：\n"
+        "  → 直接填『会場限定グッズ』（或更具體的商品名）。範例：推文提到『会場限定グッズを多数販売』→ recommended_character = '会場限定グッズ'。\n"
+        "  不要因為沒有指名單一角色就留空；留空只代表真的不知道推薦哪個。\n"
+        "需處理子團體中的角色（例：『25時、ナイトコードで。』的『奏』）。\n"
+        "**反幻覺護欄**：只能推薦推文中出現、或確實屬於該 IP 的角色／商品；禁止臆造未出現或不屬於該 IP 的角色；\n"
+        "不確定時填 null；可回 2-3 名候選（格式如『A / B』）。"
     )
 
 
 _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+_THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
 def _parse_classifier_response(raw: str) -> dict | None:
     """Tolerant JSON parser. Returns None on unparseable output — caller
-    treats that as a conservative no-signal."""
+    treats that as a conservative no-signal.
+    Strips <think>...</think> blocks (qwen3-style chain-of-thought) before
+    parsing so thinking-mode models work without reconfiguration."""
     if not raw:
         return None
-    text = _JSON_FENCE_RE.sub("", raw.strip())
+    text = _THINK_TAG_RE.sub("", raw).strip()
+    text = _JSON_FENCE_RE.sub("", text)
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
@@ -297,6 +349,12 @@ def classify_sns_signal(
         actionability=actionability,
         purchase_target_json=purchase_target_json,
         giveaway_spam=giveaway_spam,
+        is_event_signal=_coerce_bool(parsed.get("is_event_signal")),
+        event_name=_coerce_optional_str(parsed.get("event_name"), limit=200),
+        event_date=_coerce_optional_str(parsed.get("event_date"), limit=120),
+        event_location=_coerce_optional_str(parsed.get("event_location"), limit=200),
+        signup_url=_coerce_optional_str(parsed.get("signup_url"), limit=500),
+        recommended_character=_coerce_optional_str(parsed.get("recommended_character"), limit=200),
     )
 
 
@@ -308,6 +366,15 @@ def _coerce_bool(value: object) -> bool:
     if isinstance(value, (int, float)):
         return value != 0
     return False
+
+
+def _coerce_optional_str(value: object, *, limit: int = 200) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = value.strip()
+    if not cleaned or cleaned.lower() == "null":
+        return ""
+    return cleaned[:limit]
 
 
 def _empty_signal(tweet_id: str, rule_id: str, matched_entities: tuple[str, ...]) -> SnsPostSignal:
@@ -374,8 +441,13 @@ def decide_push_reason(
     """Return the bypass_reason that determines whether the monitor pushes.
 
     Values: 'giveaway_spam' / 'explicit_keyword' / 'both' / 'long_term' /
-    'arbitrage' / 'none'. Caller pushes iff the return value is none of
-    {'none', 'giveaway_spam'}.
+    'arbitrage' / 'event' / 'none'. Caller pushes iff the return value is none
+    of {'none', 'giveaway_spam'}.
+
+    Event gate (announce-stage): an IP-collab limited event/product
+    announcement (``signal.is_event_signal``) pushes even when actionability is
+    not "concrete" (no buy link yet) — it bypasses the actionability gate and,
+    if no score reason fires, falls through to the 'event' reason.
 
     Giveaway-spam override (highest priority): when the LLM judged the post a
     worthless follow+retweet raffle (``signal.giveaway_spam``), never push —
@@ -401,7 +473,7 @@ def decide_push_reason(
         return "giveaway_spam"
     if keyword_matched:
         return "explicit_keyword"
-    if signal.actionability != "concrete":
+    if signal.actionability != "concrete" and not signal.is_event_signal:
         return "none"
     effective_min = _effective_min_score(min_score, feedback_for_rule)
     lt = signal.long_term_score >= effective_min
@@ -412,4 +484,6 @@ def decide_push_reason(
         return "long_term"
     if arb:
         return "arbitrage"
+    if signal.is_event_signal:
+        return "event"
     return "none"

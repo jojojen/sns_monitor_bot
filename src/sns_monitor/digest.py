@@ -15,6 +15,38 @@ from .x_client_web import XClientWeb
 logger = logging.getLogger(__name__)
 
 
+_TARGET_CATEGORIES = {
+    "group",
+    "character",
+    "event",
+    "gacha",
+    "card",
+    "card_box",
+    "product",
+    "other",
+}
+
+_TARGET_LABELS = {
+    "group": "團體",
+    "character": "角色",
+    "event": "活動",
+    "gacha": "卡池",
+    "card": "單卡",
+    "card_box": "卡盒",
+    "product": "商品",
+    "other": "其他",
+}
+
+
+@dataclass(frozen=True)
+class BuzzTarget:
+    category: str
+    name: str
+    reason: str = ""
+    evidence: str = ""
+    confidence: int = 0
+
+
 @dataclass
 class BuzzResult:
     query: str
@@ -25,6 +57,7 @@ class BuzzResult:
     catalyst: str = ""                    # concrete event (new set/restock/price/event); "" if none
     actionable: str = ""                  # concrete watch/buy target; "" if none
     collectible_signal: str = "low"       # "high" | "medium" | "low"
+    targets: tuple[BuzzTarget, ...] = ()   # categorized concrete targets
 
     @property
     def has_signal(self) -> bool:
@@ -34,10 +67,21 @@ class BuzzResult:
         signal — persisting it would just relaunder the vague noise the user
         complained about. We require a concrete product, a catalyst event, or an
         explicit high collectible signal."""
-        return bool(self.catalyst) or bool(self.hot_items) or self.collectible_signal == "high"
+        return (
+            bool(self.catalyst)
+            or bool(self.hot_items)
+            or bool(self.targets)
+            or self.collectible_signal == "high"
+        )
 
 
-def _build_prompt(query: str, posts: list[Tweet], *, deep_context: str = "") -> str:
+def _build_prompt(
+    query: str,
+    posts: list[Tweet],
+    *,
+    deep_context: str = "",
+    entity_context: str = "",
+) -> str:
     lines = [
         f"使用者要從 4chan 收藏品/IP 板的討論，判讀「{query}」的『收藏品買賣價值訊號』。",
         f"以下是命中的 {len(posts)} 則討論串（依回覆數排序，回覆數＝熱度）：",
@@ -57,6 +101,12 @@ def _build_prompt(query: str, posts: list[Tweet], *, deep_context: str = "") -> 
             "請以這段為主要依據】：",
             deep_context,
         ])
+    if entity_context:
+        lines.extend([
+            "",
+            "【可擴充 IP 辭典（只作正規化輔助，不可當成討論證據）】：",
+            entity_context,
+        ])
     lines.extend([
         "",
         "從上面（尤其『實際討論內容』）抽出『可行動的收藏訊號』。"
@@ -69,6 +119,11 @@ def _build_prompt(query: str, posts: list[Tweet], *, deep_context: str = "") -> 
         "（例：『テラスタル フェスティバル』『リザードン ex SAR』『Leo/need』『25時、ナイトコードで。』"
         "『限定アクスタ』『64パック箱』）。"
         "沒有具體專有名詞就空陣列 []，不要用看板名硬湊。",
+        "- targets：把 hot_items 拆成分類物件。category 僅能是 "
+        "group/character/event/gacha/card/card_box/product/other。"
+        "name 必須是實際討論內容出現的標的，或由 IP 辭典正規化後的同一標的；"
+        "reason 寫為何有收藏/入手機會；evidence 放 4chan 內容中的短證據；confidence 0-100。"
+        "沒有具體標的就 []。",
         "- catalyst：推動這波討論的『具體事件』——新彈上市/復刻/漲價/缺貨/聯名/活動/新作發表/再販 等。"
         "沒有明確事件就填 null（不要硬掰）。",
         "- actionable：從收藏或轉售角度，『具體』值得關注或入手的標的，並簡述為何可能增值"
@@ -79,7 +134,10 @@ def _build_prompt(query: str, posts: list[Tweet], *, deep_context: str = "") -> 
         "",
         "嚴格以 JSON 回覆，不要 markdown 程式碼框：",
         '{"hot_items": [...], "catalyst": "... 或 null", "actionable": "... 或 null", '
-        '"collectible_signal": "high|medium|low", "picks": [編號, ...]}',
+        '"collectible_signal": "high|medium|low", '
+        '"targets": [{"category": "group|character|event|gacha|card|card_box|product|other", '
+        '"name": "...", "reason": "...", "evidence": "...", "confidence": 0-100}], '
+        '"picks": [編號, ...]}',
     ])
     return "\n".join(lines)
 
@@ -87,15 +145,33 @@ def _build_prompt(query: str, posts: list[Tweet], *, deep_context: str = "") -> 
 _SIGNAL_LABELS = {"high": "高", "medium": "中", "low": "低"}
 
 
+def _format_targets(targets: tuple[BuzzTarget, ...]) -> str:
+    if not targets:
+        return ""
+    grouped: dict[str, list[str]] = {}
+    for target in targets:
+        label = _TARGET_LABELS.get(target.category, "其他")
+        if target.name not in grouped.setdefault(label, []):
+            grouped[label].append(target.name)
+    return "；".join(f"{label}：" + "、".join(names) for label, names in grouped.items())
+
+
 def _compose_summary(
-    hot_items: tuple[str, ...], catalyst: str, actionable: str, signal: str
+    hot_items: tuple[str, ...],
+    catalyst: str,
+    actionable: str,
+    signal: str,
+    targets: tuple[BuzzTarget, ...] = (),
 ) -> str:
     """Build the human-facing conclusion from structured fields — deterministic,
     noun-driven, no LLM sentiment filler."""
     sig_label = _SIGNAL_LABELS.get(signal, "低")
-    if not hot_items and not catalyst and not actionable:
+    if not hot_items and not catalyst and not actionable and not targets:
         return f"多為一般討論，無明確收藏催化或入手標的（收藏訊號：{sig_label}）。"
     parts: list[str] = []
+    target_text = _format_targets(targets)
+    if target_text:
+        parts.append("具體標的：" + target_text)
     if hot_items:
         parts.append("熱門標的：" + "、".join(hot_items))
     if catalyst:
@@ -160,7 +236,31 @@ class _ParsedBuzz:
     catalyst: str
     actionable: str
     collectible_signal: str
+    targets: tuple[BuzzTarget, ...]
     picks: list[Tweet]
+
+
+def _coerce_target(raw: object) -> BuzzTarget | None:
+    if not isinstance(raw, dict):
+        return None
+    name = _coerce_optional(raw.get("name"))
+    if not name:
+        return None
+    category = _coerce_optional(raw.get("category")).lower()
+    if category not in _TARGET_CATEGORIES:
+        category = "other"
+    try:
+        confidence = int(raw.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0
+    confidence = max(0, min(100, confidence))
+    return BuzzTarget(
+        category=category,
+        name=name[:120],
+        reason=_coerce_optional(raw.get("reason"))[:240],
+        evidence=_coerce_optional(raw.get("evidence"))[:240],
+        confidence=confidence,
+    )
 
 
 def _parse_llm_response(text: str, tweets: list[Tweet]) -> _ParsedBuzz:
@@ -184,6 +284,24 @@ def _parse_llm_response(text: str, tweets: list[Tweet]) -> _ParsedBuzz:
             s for s in (str(x).strip() for x in hot_raw) if s and s.lower() != "null"
         )[:8]
 
+        targets_raw = data.get("targets") or []
+        if not isinstance(targets_raw, list):
+            targets_raw = []
+        targets_list: list[BuzzTarget] = []
+        seen_targets: set[tuple[str, str]] = set()
+        for raw_target in targets_raw:
+            target = _coerce_target(raw_target)
+            if target is None:
+                continue
+            key = (target.category, target.name.casefold())
+            if key in seen_targets:
+                continue
+            seen_targets.add(key)
+            targets_list.append(target)
+            if len(targets_list) >= 12:
+                break
+        targets = tuple(targets_list)
+
         catalyst = _coerce_optional(data.get("catalyst"))
         actionable = _coerce_optional(data.get("actionable"))
         signal = str(data.get("collectible_signal") or "low").strip().lower()
@@ -201,10 +319,10 @@ def _parse_llm_response(text: str, tweets: list[Tweet]) -> _ParsedBuzz:
         if not picks:
             picks = tweets[:3]
 
-        return _ParsedBuzz(hot_items, catalyst, actionable, signal, picks)
+        return _ParsedBuzz(hot_items, catalyst, actionable, signal, targets, picks)
     except (json.JSONDecodeError, ValueError, TypeError) as e:
         logger.warning("Buzz LLM response not parseable, treating as no-signal: %s", e)
-        return _ParsedBuzz((), "", "", "low", tweets[:3])
+        return _ParsedBuzz((), "", "", "low", (), tweets[:3])
 
 
 async def _gather_tweets(
@@ -238,6 +356,7 @@ async def summarize_topic(
     max_tweets: int = 30,
     llm_call_fn: Optional[Callable[[str], str]] = None,
     deep_context_fn: Optional[Callable[[list[Tweet]], str]] = None,
+    entity_context_fn: Optional[Callable[[str, tuple[str, ...], list[Tweet], str], str]] = None,
     search_aliases: tuple[str, ...] = (),
 ) -> Optional[BuzzResult]:
     """Search X for a topic, summarize via LLM, return summary + source tweets.
@@ -266,7 +385,23 @@ async def summarize_topic(
             logger.exception("Deep-context fetch failed for query=%s", query)
             deep_context = ""
 
-    prompt = _build_prompt(source_label, tweets, deep_context=deep_context)
+    entity_context = ""
+    if entity_context_fn is not None:
+        try:
+            entity_context = await loop.run_in_executor(
+                None,
+                lambda: entity_context_fn(query, search_aliases, tweets, deep_context) or "",
+            )
+        except Exception:
+            logger.exception("Entity-context build failed for query=%s", query)
+            entity_context = ""
+
+    prompt = _build_prompt(
+        source_label,
+        tweets,
+        deep_context=deep_context,
+        entity_context=entity_context,
+    )
     call = llm_call_fn or (
         lambda p: _call_ollama(llm_endpoint, llm_model, p,
                                timeout=llm_timeout, ssl_context=ssl_context)
@@ -286,7 +421,11 @@ async def summarize_topic(
 
     parsed = _parse_llm_response(raw, tweets)
     summary = _compose_summary(
-        parsed.hot_items, parsed.catalyst, parsed.actionable, parsed.collectible_signal
+        parsed.hot_items,
+        parsed.catalyst,
+        parsed.actionable,
+        parsed.collectible_signal,
+        parsed.targets,
     )
     return BuzzResult(
         query=source_label,
@@ -297,6 +436,7 @@ async def summarize_topic(
         catalyst=parsed.catalyst,
         actionable=parsed.actionable,
         collectible_signal=parsed.collectible_signal,
+        targets=parsed.targets,
     )
 
 
@@ -311,6 +451,7 @@ def summarize_topic_sync(
     max_tweets: int = 30,
     llm_call_fn: Optional[Callable[[str], str]] = None,
     deep_context_fn: Optional[Callable[[list[Tweet]], str]] = None,
+    entity_context_fn: Optional[Callable[[str, tuple[str, ...], list[Tweet], str], str]] = None,
     search_aliases: tuple[str, ...] = (),
 ) -> Optional[BuzzResult]:
     """Blocking wrapper for Telegram command processor."""
@@ -324,12 +465,23 @@ def summarize_topic_sync(
         max_tweets=max_tweets,
         llm_call_fn=llm_call_fn,
         deep_context_fn=deep_context_fn,
+        entity_context_fn=entity_context_fn,
         search_aliases=search_aliases,
     ))
 
 
 def format_buzz_reply(result: BuzzResult) -> str:
     """Format BuzzResult as a Telegram message."""
+    if not result.has_signal:
+        return "\n".join([
+            f"🔥 熱門整理：{result.query}",
+            f"（共抓取 {result.fetched_count} 則討論串，依回覆數排序）",
+            "",
+            result.summary,
+            "",
+            "目前沒有抽到具體收藏催化或入手標的；不列來源串，避免把一般閒聊誤當新知。",
+        ])
+
     lines = [
         f"🔥 熱門整理：{result.query}",
         f"（共抓取 {result.fetched_count} 則討論串，依回覆數排序）",

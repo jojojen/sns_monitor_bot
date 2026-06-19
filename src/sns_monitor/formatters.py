@@ -130,6 +130,7 @@ def build_sns_feedback_keyboard(*, tweet_id: str, rule_id: str) -> dict[str, obj
 _LONG_TERM_HEADLINE = "📈 長期潛力訊號"
 _ARBITRAGE_HEADLINE = "⚡ 立即套利訊號"
 _COMBINED_HEADLINE = "📈⚡ 雙重訊號（長期 + 立即）"
+_EVENT_HEADLINE = "📅 限定活動訊號"
 
 
 def _truncate_tweet(text: str, limit: int = 240) -> str:
@@ -167,6 +168,19 @@ def _signal_body_lines(
         lines.append("關鍵字：" + "、".join(signal.matched_keywords))
     if signal.matched_entities:
         lines.append("提及實體：" + "、".join(signal.matched_entities))
+
+    if getattr(signal, "is_event_signal", False):
+        if signal.event_name:
+            lines.append("活動：" + signal.event_name)
+        if signal.event_date:
+            lines.append("活動時間：" + signal.event_date)
+        if signal.event_location:
+            lines.append("地點：" + signal.event_location)
+        if signal.signup_url:
+            lines.append("報名：" + signal.signup_url)
+        if signal.recommended_character:
+            lines.append("🎯 推薦角色：" + signal.recommended_character)
+
     if signal.suggested_action:
         lines.append("建議：" + signal.suggested_action)
     if signal.deadline_iso:
@@ -275,7 +289,7 @@ def format_signal_notification(
     """Pick the right signal formatter based on ``bypass_reason``.
 
     bypass_reason values (from ``signal_classifier.decide_push_reason``):
-      'explicit_keyword' / 'both' / 'long_term' / 'arbitrage'
+      'explicit_keyword' / 'both' / 'long_term' / 'arbitrage' / 'event'
     For 'explicit_keyword' (Bypass A), the headline is chosen by whichever
     score is higher; if both are zero we still show as long_term — the
     bypass header above already explains why this is here.
@@ -286,6 +300,8 @@ def format_signal_notification(
         headline = _ARBITRAGE_HEADLINE
     elif bypass_reason == "long_term":
         headline = _LONG_TERM_HEADLINE
+    elif bypass_reason == "event":
+        headline = _EVENT_HEADLINE
     else:  # explicit_keyword
         if signal.arbitrage_score > signal.long_term_score:
             headline = _ARBITRAGE_HEADLINE

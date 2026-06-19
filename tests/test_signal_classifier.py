@@ -110,6 +110,15 @@ def test_parse_classifier_response_finds_json_object_in_chatter():
     assert parsed["arbitrage_score"] == 70
 
 
+def test_parse_classifier_response_strips_think_tags():
+    """qwen3-style <think>…</think> blocks must be stripped before JSON parsing."""
+    raw = "<think>Let me analyze this tweet carefully...</think>\n{\"long_term_score\": 75, \"is_event_signal\": true}"
+    parsed = _parse_classifier_response(raw)
+    assert parsed is not None
+    assert parsed["is_event_signal"] is True
+    assert parsed["long_term_score"] == 75
+
+
 def test_parse_classifier_response_returns_none_for_garbage():
     assert _parse_classifier_response("") is None
     assert _parse_classifier_response("not json at all") is None
@@ -187,6 +196,50 @@ def test_classify_treats_null_deadline_as_none():
     assert signal.deadline_iso is None
 
 
+def test_classify_parses_event_fields_from_llm():
+    def llm(_prompt):
+        return (
+            '{"long_term_score": 40, "arbitrage_score": 20, '
+            '"is_event_signal": true, '
+            '"event_name": "名探偵プリキュア！展", '
+            '"event_date": "2026-05-15", '
+            '"event_location": "横浜・新高島駅B1F Art Center NEW", '
+            '"signup_url": "https://w.pia.jp/t/precure-exh/", '
+            '"recommended_character": "会場限定グッズ（キュアアルカナ）"}'
+        )
+    signal = classify_sns_signal(**_make_kwargs(llm_fn=llm))
+    assert signal.is_event_signal is True
+    assert signal.event_name == "名探偵プリキュア！展"
+    assert signal.event_date == "2026-05-15"
+    assert "Art Center" in signal.event_location
+    assert signal.signup_url == "https://w.pia.jp/t/precure-exh/"
+    assert "キュアアルカナ" in signal.recommended_character
+
+
+def test_classify_event_fields_default_when_missing():
+    def llm(_prompt):
+        return '{"long_term_score": 10, "arbitrage_score": 10}'
+    signal = classify_sns_signal(**_make_kwargs(llm_fn=llm))
+    assert signal.is_event_signal is False
+    assert signal.event_name == ""
+    assert signal.event_date == ""
+    assert signal.event_location == ""
+    assert signal.signup_url == ""
+    assert signal.recommended_character == ""
+
+
+def test_classify_event_fields_treat_null_string_as_empty():
+    def llm(_prompt):
+        return (
+            '{"long_term_score": 10, "arbitrage_score": 10, '
+            '"is_event_signal": true, "recommended_character": "null", '
+            '"event_name": "   "}'
+        )
+    signal = classify_sns_signal(**_make_kwargs(llm_fn=llm))
+    assert signal.recommended_character == ""
+    assert signal.event_name == ""
+
+
 def test_classify_propagates_matched_entities_through():
     """matched_entities is set by caller (alias extractor), not the LLM, so it
     must come through unchanged whether LLM succeeds or fails."""
@@ -199,7 +252,8 @@ def test_classify_propagates_matched_entities_through():
 # ── decide_push_reason (Bypass A guardrail) ─────────────────────────────────
 
 
-def _signal(lt=0, arb=0, actionability="concrete", purchase_target_json=None, giveaway_spam=False):
+def _signal(lt=0, arb=0, actionability="concrete", purchase_target_json=None,
+            giveaway_spam=False, is_event_signal=False):
     """Helper for score-gate tests. Defaults to actionability='concrete' so
     existing tests exercise the score logic (not the actionability gate).
     The dedicated actionability tests below pass actionability='vague'
@@ -212,6 +266,7 @@ def _signal(lt=0, arb=0, actionability="concrete", purchase_target_json=None, gi
         actionability=actionability,
         purchase_target_json=purchase_target_json,
         giveaway_spam=giveaway_spam,
+        is_event_signal=is_event_signal,
     )
 
 
@@ -265,6 +320,38 @@ def test_decide_push_reason_respects_custom_threshold():
     sig = _signal(lt=40, arb=40)
     assert decide_push_reason(signal=sig, keyword_matched=False, min_score=DEFAULT_MIN_SCORE_TO_PUSH) == "none"
     assert decide_push_reason(signal=sig, keyword_matched=False, min_score=30) == "both"
+
+
+# ── event-signal gate (announce-stage relaxation) ───────────────────────────
+
+
+def test_event_signal_pushes_even_when_vague():
+    """A limited IP-collab event announcement with no buy link yet
+    (actionability='vague') must still push — it bypasses the actionability
+    gate and falls through to the 'event' reason when no score fires."""
+    sig = _signal(lt=0, arb=0, actionability="vague", is_event_signal=True)
+    assert decide_push_reason(signal=sig, keyword_matched=False) == "event"
+
+
+def test_event_signal_with_score_uses_score_reason():
+    """When an event signal also clears the score gate, the richer score
+    reason wins over the bare 'event' fallthrough."""
+    sig = _signal(lt=80, arb=20, actionability="vague", is_event_signal=True)
+    assert decide_push_reason(signal=sig, keyword_matched=False) == "long_term"
+
+
+def test_giveaway_spam_still_overrides_event_signal():
+    """giveaway_spam stays the highest-priority gate even if the LLM also
+    marked is_event_signal — a worthless raffle never pushes."""
+    sig = _signal(lt=0, arb=0, giveaway_spam=True, is_event_signal=True)
+    assert decide_push_reason(signal=sig, keyword_matched=True) == "giveaway_spam"
+
+
+def test_non_event_vague_signal_still_silenced():
+    """The relaxation is scoped to event signals only: an ordinary vague
+    signal with no event flag is still dropped."""
+    sig = _signal(lt=0, arb=0, actionability="vague", is_event_signal=False)
+    assert decide_push_reason(signal=sig, keyword_matched=False) == "none"
 
 
 # ── feedback push-probability boost ─────────────────────────────────────────

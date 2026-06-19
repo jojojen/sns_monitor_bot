@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sns_monitor.digest import (
+    BuzzTarget,
     BuzzResult,
     _build_prompt,
     _compose_summary,
@@ -83,6 +84,22 @@ def test_compose_summary_includes_nouns_and_catalyst():
     assert "高" in out
 
 
+def test_compose_summary_groups_categorized_targets():
+    out = _compose_summary(
+        (),
+        "限定ガチャ",
+        "",
+        "medium",
+        (
+            BuzzTarget(category="gacha", name="Past Fragments"),
+            BuzzTarget(category="character", name="巡音ルカ"),
+        ),
+    )
+    assert "卡池：Past Fragments" in out
+    assert "角色：巡音ルカ" in out
+    assert "限定ガチャ" in out
+
+
 # ── _parse_llm_response ─────────────────────────────────────────────────────
 
 
@@ -98,6 +115,22 @@ def test_parse_extracts_structured_fields():
     assert parsed.actionable == "關注未開封盒"
     assert parsed.collectible_signal == "high"
     assert [t.tweet_id for t in parsed.picks] == ["1", "3"]
+
+
+def test_parse_extracts_categorized_targets():
+    tweets = _tweets(3)
+    raw = (
+        '{"hot_items": [], "catalyst": "World Link", "collectible_signal": "medium", '
+        '"targets": ['
+        '{"category": "gacha", "name": "Past Fragments", "reason": "limited", '
+        '"evidence": "Current Gacha Past Fragments", "confidence": 88}, '
+        '{"category": "character", "name": "巡音ルカ", "confidence": 90}'
+        '], "picks": [1]}'
+    )
+    parsed = _parse_llm_response(raw, tweets)
+    assert [t.name for t in parsed.targets] == ["Past Fragments", "巡音ルカ"]
+    assert parsed.targets[0].category == "gacha"
+    assert parsed.targets[0].confidence == 88
 
 
 def test_parse_strips_markdown_fence():
@@ -148,6 +181,13 @@ def test_prompt_includes_deep_context_when_present():
     assert "【最熱串的實際討論內容" in prompt
 
 
+def test_prompt_includes_entity_context_when_present():
+    prompt = _build_prompt("pjsk", _tweets(2), entity_context="IP: Project SEKAI\ncharacter: 巡音ルカ")
+    assert "【可擴充 IP 辭典" in prompt
+    assert "Project SEKAI" in prompt
+    assert "targets" in prompt
+
+
 def test_prompt_omits_deep_section_when_absent():
     prompt = _build_prompt("pjsk", _tweets(2))
     assert "【最熱串的實際討論內容" not in prompt
@@ -193,3 +233,35 @@ def test_summarize_uses_injected_llm_and_deep_context():
     assert res.collectible_signal == "high"
     assert res.has_signal
     assert "Leo/need" in res.summary
+
+
+def test_summarize_uses_entity_context_fn():
+    captured = {}
+
+    def fake_llm(prompt):
+        captured["prompt"] = prompt
+        return (
+            '{"hot_items": [], "catalyst": "限定ガチャ", "collectible_signal": "medium", '
+            '"targets": [{"category": "gacha", "name": "Past Fragments", "confidence": 80}], '
+            '"picks": [1]}'
+        )
+
+    def fake_entities(query, aliases, tweets, deep_context):
+        assert query == "pjsk"
+        assert aliases == ("Project Sekai",)
+        return "IP: Project SEKAI\ncharacter: 巡音ルカ"
+
+    res = summarize_topic_sync(
+        "pjsk",
+        x_client=_FakeX(_tweets(2)),
+        llm_endpoint="http://x",
+        llm_model="m",
+        llm_call_fn=fake_llm,
+        entity_context_fn=fake_entities,
+        search_aliases=("Project Sekai",),
+    )
+
+    assert "IP: Project SEKAI" in captured["prompt"]
+    assert res is not None
+    assert res.targets[0].name == "Past Fragments"
+    assert "卡池：Past Fragments" in res.summary

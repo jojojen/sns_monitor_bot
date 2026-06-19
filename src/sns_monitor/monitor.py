@@ -194,6 +194,12 @@ class SnsMonitor:
                 except Exception:
                     logger.exception("Check failed rule_id=%s", rule.rule_id)
 
+        # Fire any day-before event/signup reminders that have come due.
+        # Independent of rule scheduling; runs every tick. Unsent rows persist
+        # across restarts, so a reminder fires on the first tick after its
+        # remind_at regardless of process lifetime.
+        await self._check_due_reminders()
+
     def _is_due(self, rule: AccountWatch | KeywordWatch | TrendWatch) -> bool:
         """Check if a rule is due for checking based on schedule.
 
@@ -588,6 +594,99 @@ class SnsMonitor:
                 "classifier: notify failed rule_id=%s tweet_id=%s",
                 rule.rule_id, tweet.tweet_id,
             )
+
+        # After a successful announce-stage push of a limited-event signal,
+        # schedule up to two day-before reminders (signup deadline + event).
+        # The rendered notification body is stored verbatim so the reminder is
+        # self-contained across restarts.
+        if tweet.tweet_id in delivered and signal.is_event_signal:
+            self._schedule_event_reminders(rule=rule, tweet=tweet, signal=signal, body_text=text)
+
+    @staticmethod
+    def _parse_iso_to_utc(value: str | None) -> _dt_datetime | None:
+        """Best-effort parse of an ISO8601 / date-only string into tz-aware UTC.
+        Returns None when unparseable so the caller simply skips scheduling."""
+        if not value:
+            return None
+        raw = value.strip()
+        candidates = [raw]
+        if raw.endswith("Z"):
+            candidates.append(raw[:-1] + "+00:00")
+        for cand in candidates:
+            try:
+                dt = _dt_datetime.fromisoformat(cand)
+            except ValueError:
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_dt_timezone.utc)
+            return dt.astimezone(_dt_timezone.utc)
+        try:
+            dt = _dt_datetime.strptime(raw[:10], "%Y-%m-%d")
+            return dt.replace(tzinfo=_dt_timezone.utc)
+        except ValueError:
+            return None
+
+    def _schedule_event_reminders(
+        self,
+        *,
+        rule: AccountWatch | KeywordWatch,
+        tweet: Tweet,
+        signal: SnsPostSignal,
+        body_text: str,
+    ) -> None:
+        now = utc_now()
+
+        def _schedule(kind: str, target_raw: str | None, header: str) -> None:
+            target = self._parse_iso_to_utc(target_raw)
+            if target is None or target < now:
+                return  # unparseable, or the date already passed → no reminder
+            remind_at = target - _dt_timedelta(hours=24)
+            if remind_at < now:
+                remind_at = now  # discovered <24h out → fire next tick
+            payload = header + "\n\n" + body_text
+            try:
+                self._db.create_reminder(
+                    chat_id=rule.chat_id,
+                    rule_id=rule.rule_id,
+                    tweet_id=tweet.tweet_id,
+                    kind=kind,
+                    target_date=target.isoformat(),
+                    remind_at=remind_at.isoformat(),
+                    payload_text=payload,
+                )
+            except Exception:
+                logger.exception(
+                    "reminders: failed to schedule %s reminder rule_id=%s tweet_id=%s",
+                    kind, rule.rule_id, tweet.tweet_id,
+                )
+
+        # Signup reminder: only when advance registration is required (a signup
+        # URL was extracted) AND an apply-by deadline is known.
+        if signal.signup_url and signal.deadline_iso:
+            _schedule("signup", signal.deadline_iso, "⏰ 報名前提醒")
+        # Event reminder: when the event/sale start date is parseable.
+        if signal.event_date:
+            _schedule("event", signal.event_date, "⏰ 活動前提醒")
+
+    async def _check_due_reminders(self) -> None:
+        now_iso = utc_now().isoformat()
+        try:
+            due = self._db.list_due_reminders(now_iso)
+        except Exception:
+            logger.exception("reminders: failed to list due reminders")
+            return
+        for row in due:
+            reminder_id = row["reminder_id"]
+            try:
+                try:
+                    self._notify_fn(row["chat_id"], row["payload_text"])
+                except TypeError:
+                    self._notify_fn(row["chat_id"], row["payload_text"], None)  # type: ignore[call-arg]
+                self._db.mark_reminder_sent(reminder_id)
+            except Exception:
+                logger.exception(
+                    "reminders: failed to deliver reminder_id=%s", reminder_id,
+                )
 
     async def _check_keyword_watch(self, rule: KeywordWatch) -> None:
         """Check a keyword watch rule via its source plugin."""
