@@ -77,31 +77,33 @@ def test_legacy_rule_id_format_preserved_for_x_source() -> None:
     same_with_explicit_x = SnsDatabase._watch_rule_id("account", "elonmusk", "x")
     assert legacy == same_with_explicit_x
 
-    reddit_id = SnsDatabase._watch_rule_id("account", "PokemonTCG", "reddit")
-    assert reddit_id.startswith("reddit_account_")
-    assert reddit_id != SnsDatabase._watch_rule_id("account", "PokemonTCG")
+    # A non-X source string gets the new prefixed rule_id format. (The storage
+    # layer stays source-agnostic even though Reddit itself has been removed.)
+    other_id = SnsDatabase._watch_rule_id("account", "PokemonTCG", "4chan")
+    assert other_id.startswith("4chan_account_")
+    assert other_id != SnsDatabase._watch_rule_id("account", "PokemonTCG")
 
 
-def test_save_and_load_reddit_watch_rule(tmp_path: Path) -> None:
-    db = SnsDatabase(tmp_path / "reddit.db")
+def test_save_and_load_non_x_watch_rule(tmp_path: Path) -> None:
+    db = SnsDatabase(tmp_path / "other.db")
     db.bootstrap()
     rule = AccountWatch(
-        rule_id=SnsDatabase._watch_rule_id("account", "PokemonTCG", "reddit"),
+        rule_id=SnsDatabase._watch_rule_id("account", "PokemonTCG", "4chan"),
         screen_name="PokemonTCG",
         user_id="PokemonTCG",
-        label="r/PokemonTCG",
+        label="/vp/",
         include_keywords=(),
         domains=("pokemon",),
         enabled=True,
         schedule_minutes=30,
         chat_id="99999",
         last_checked_at=None,
-        source="reddit",
+        source="4chan",
     )
     db.save_watch_rule(rule)
 
     loaded = db.get_watch_rule(rule.rule_id)
     assert isinstance(loaded, AccountWatch)
-    assert loaded.source == "reddit"
+    assert loaded.source == "4chan"
     assert loaded.screen_name == "PokemonTCG"
     assert loaded.schedule_minutes == 30

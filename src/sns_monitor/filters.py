@@ -9,11 +9,8 @@ from collections.abc import Iterable
 from .models import Tweet
 
 _ACCOUNT_HANDLE_RE = re.compile(r"^@(?P<handle>[A-Za-z0-9_]{1,15})(?:\s+(?P<filters>.*))?$")
-_SUBREDDIT_HANDLE_RE = re.compile(
-    r"^/?r/(?P<handle>[A-Za-z0-9_]{2,21})(?:\s+(?P<filters>.*))?$", re.IGNORECASE
-)
 _SCHEDULE_TOKEN_RE = re.compile(r"(?<!\w)schedule\s*[:=]\s*(\d{1,4})\b", re.IGNORECASE)
-_KNOWN_SOURCES: tuple[str, ...] = ("reddit", "x")
+_KNOWN_SOURCES: tuple[str, ...] = ("x",)
 _FILTER_PREFIX_RE = re.compile(r"^(?:--)?(?:include-)?(?:keywords?|filters?)\s*[:=]?\s*", re.IGNORECASE)
 _BRACKETED_FILTER_RE = re.compile(r"[\[\(]([^\]\)]+)[\]\)]")
 # Captures `filter[...]` / `domain[...]` labelled brackets (case-insensitive,
@@ -142,17 +139,16 @@ def extract_labeled_brackets(raw: str) -> tuple[tuple[str, ...] | None, tuple[st
 def parse_account_watch_text(
     raw: str,
 ) -> tuple[str, tuple[str, ...], tuple[str, ...] | None] | None:
-    """Parse '@handle' (X) OR 'r/sub' (Reddit) optionally followed by
+    """Parse '@handle' (X) optionally followed by
     filter[...]/domain[...]/legacy ["a","b"] keywords.
 
     Returns ``(handle, include_keywords, domains)`` where ``domains`` is
     ``None`` if the user did NOT supply a ``domain[...]`` bracket (caller
     should preserve the existing rule's domains in that case). The returned
-    handle is bare — caller decides whether to render it as `@x` or `r/x`
-    based on the source field.
+    handle is bare.
     """
     explicit_filter, domains, remainder = extract_labeled_brackets(raw.strip())
-    match = _ACCOUNT_HANDLE_RE.match(remainder) or _SUBREDDIT_HANDLE_RE.match(remainder)
+    match = _ACCOUNT_HANDLE_RE.match(remainder)
     if match is None:
         return None
     handle = match.group("handle")
@@ -181,8 +177,7 @@ def split_source_prefix(raw: str) -> tuple[str, str]:
 
 
 # Hosts whose first path segment is an account handle (X/Twitter family and
-# Nitter mirrors). Reddit is handled separately (its r/<sub> path keeps the
-# `r/` segment so the subreddit parser matches).
+# Nitter mirrors).
 _X_URL_HOSTS: frozenset[str] = frozenset({
     "x.com", "twitter.com", "mobile.twitter.com", "mobile.x.com",
     "fxtwitter.com", "vxtwitter.com", "fixupx.com", "nitter.net",
@@ -192,19 +187,15 @@ _X_RESERVED_SEGMENTS: frozenset[str] = frozenset({
     "i", "home", "search", "hashtag", "explore", "notifications",
     "messages", "settings", "compose", "intent", "share", "login",
 })
-_REDDIT_URL_HOSTS: frozenset[str] = frozenset({
-    "reddit.com", "old.reddit.com", "np.reddit.com", "new.reddit.com",
-})
 
 
 def rewrite_social_url(raw: str) -> str:
     """Rewrite a pasted profile URL into the bare command form the parsers
     expect, leaving any trailing filter/domain/schedule tokens untouched.
 
-    ``https://x.com/pcgl_shibuya?s=21`` → ``@pcgl_shibuya`` and
-    ``https://www.reddit.com/r/PokemonTCG/`` → ``reddit:r/PokemonTCG``. Input
-    that isn't a recognised profile URL is returned unchanged, so existing
-    ``@handle`` / ``reddit:r/sub`` / ``keyword:`` forms keep working.
+    ``https://x.com/pcgl_shibuya?s=21`` → ``@pcgl_shibuya``. Input that isn't a
+    recognised profile URL is returned unchanged, so existing ``@handle`` /
+    ``keyword:`` forms keep working.
     """
     from urllib.parse import urlsplit
 
@@ -239,11 +230,6 @@ def rewrite_social_url(raw: str) -> str:
             return raw
         handle = segments[0]
         return f"@{handle} {rest}".strip()
-
-    if host in _REDDIT_URL_HOSTS:
-        if len(segments) >= 2 and segments[0].lower() == "r":
-            return f"reddit:r/{segments[1]} {rest}".strip()
-        return raw
 
     return raw
 

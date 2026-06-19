@@ -69,9 +69,9 @@ class XClientWeb:
     """Hybrid social client.
 
     - `get_timeline` fetches X (Twitter) account timelines via Nitter RSS.
-    - `search` is keyword-search on Reddit (via injected `buzz_search_backend`).
-      X public search is blocked / behind login and the searches users actually
-      ask for ("Trump", "amd") return better discussion on Reddit anyway.
+    - `search` is keyword-search on 4chan (via injected `buzz_search_backend`).
+      X public search is blocked / behind login; 4chan's open JSON API gives
+      collectible/IP discussion without auth.
     """
 
     _COOLDOWN_SECONDS = 600.0
@@ -218,15 +218,23 @@ class XClientWeb:
         """Nitter uses screen_name directly; just return it cleaned."""
         return screen_name.lstrip("@")
 
-    async def search(self, query: str, *, count: int = 15) -> list[Tweet]:
-        """Keyword buzz search (currently backed by Reddit via injected backend)."""
+    async def search(
+        self, query: str, *, count: int = 15, aliases=()
+    ) -> list[Tweet]:
+        """Keyword buzz search (currently backed by 4chan via injected backend).
+
+        ``aliases`` (optional) are alternative names for the query resolved by
+        the caller's knowledge DB (RAG); the backend matches a thread when it is
+        about the query *or* any alias, so 'pjsk' still finds 'Project SEKAI'."""
         if self._is_disabled():
             return []
         if self._buzz_search_backend is None:
             logger.warning("XClientWeb.search: no buzz_search_backend configured")
             return []
         try:
-            posts = await self._buzz_search_backend.search(query, count=count)
+            posts = await self._buzz_search_backend.search(
+                query, count=count, aliases=aliases
+            )
             posts = sorted(posts, key=lambda t: t.like_count, reverse=True)
             return posts[:count]
         except Exception:

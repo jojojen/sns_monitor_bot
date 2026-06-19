@@ -1,4 +1,4 @@
-"""Tests for split_source_prefix, extract_schedule_minutes, and r/ subreddit parsing."""
+"""Tests for split_source_prefix, extract_schedule_minutes, and URL rewriting."""
 
 from __future__ import annotations
 
@@ -13,12 +13,6 @@ from sns_monitor.filters import (
 # ── split_source_prefix ──────────────────────────────────────────────────────
 
 
-def test_split_source_prefix_reddit() -> None:
-    assert split_source_prefix("reddit:r/PokemonTCG") == ("reddit", "r/PokemonTCG")
-    assert split_source_prefix("REDDIT:r/yugioh") == ("reddit", "r/yugioh")
-    assert split_source_prefix("reddit: r/pokemon ") == ("reddit", "r/pokemon")
-
-
 def test_split_source_prefix_x() -> None:
     assert split_source_prefix("x:@elonmusk") == ("x", "@elonmusk")
     assert split_source_prefix("X:keyword:foo") == ("x", "keyword:foo")
@@ -29,7 +23,6 @@ def test_split_source_prefix_backcompat_default_is_x() -> None:
     assert split_source_prefix("@elonmusk") == ("x", "@elonmusk")
     assert split_source_prefix("keyword:foo") == ("x", "keyword:foo")
     assert split_source_prefix("trend:trending") == ("x", "trend:trending")
-    assert split_source_prefix("r/PokemonTCG") == ("x", "r/PokemonTCG")  # no prefix → x
 
 
 # ── extract_schedule_minutes ─────────────────────────────────────────────────
@@ -56,7 +49,7 @@ def test_extract_schedule_minutes_missing_returns_none() -> None:
 
 
 def test_extract_schedule_minutes_clamps_out_of_range() -> None:
-    # Below 5min → reject (too aggressive against Reddit rate limit)
+    # Below 5min → reject (too aggressive against host rate limits)
     minutes, _ = extract_schedule_minutes("@x schedule:1")
     assert minutes is None
     # Above 1440min (24h) → reject (effectively disabled)
@@ -64,35 +57,10 @@ def test_extract_schedule_minutes_clamps_out_of_range() -> None:
     assert minutes is None
 
 
-# ── r/subreddit parsing ──────────────────────────────────────────────────────
+# ── @handle parsing ──────────────────────────────────────────────────────────
 
 
-def test_parse_account_watch_text_accepts_subreddit_form() -> None:
-    result = parse_account_watch_text("r/PokemonTCG")
-    assert result is not None
-    handle, kw, domains = result
-    assert handle == "PokemonTCG"
-    assert kw == ()
-    assert domains is None
-
-
-def test_parse_account_watch_text_accepts_subreddit_with_domain() -> None:
-    result = parse_account_watch_text("r/PokemonTCG domain[pokemon]")
-    assert result is not None
-    handle, _, domains = result
-    assert handle == "PokemonTCG"
-    assert domains == ("pokemon",)
-
-
-def test_parse_account_watch_text_rejects_invalid_subreddit() -> None:
-    # Single char name is below Reddit's 2-char minimum
-    assert parse_account_watch_text("r/a") is None
-    # 22 chars exceeds Reddit's 21-char limit
-    assert parse_account_watch_text(f"r/{'a' * 22}") is None
-
-
-def test_parse_account_watch_text_still_handles_at_handle() -> None:
-    # Backcompat: @handle path must still work after r/ branch was added.
+def test_parse_account_watch_text_handles_at_handle() -> None:
     result = parse_account_watch_text("@elonmusk")
     assert result is not None
     assert result[0] == "elonmusk"
@@ -130,10 +98,13 @@ def test_rewrite_schemeless_url() -> None:
     assert rewrite_social_url("x.com/pcgl_shibuya") == "@pcgl_shibuya"
 
 
-def test_rewrite_reddit_url_to_prefix_form() -> None:
-    assert rewrite_social_url("https://www.reddit.com/r/PokemonTCG/") == "reddit:r/PokemonTCG"
-    out = rewrite_social_url("https://old.reddit.com/r/yugioh domain[ygo]")
-    assert out == "reddit:r/yugioh domain[ygo]"
+def test_rewrite_reddit_url_left_untouched() -> None:
+    # Reddit support is removed; reddit URLs are no longer recognized and pass
+    # through unchanged rather than being rewritten to a reddit: prefix.
+    assert (
+        rewrite_social_url("https://www.reddit.com/r/PokemonTCG/")
+        == "https://www.reddit.com/r/PokemonTCG/"
+    )
 
 
 def test_rewrite_ignores_reserved_x_paths() -> None:
@@ -146,5 +117,4 @@ def test_rewrite_passes_through_non_url_forms() -> None:
     # Existing command forms must be untouched.
     assert rewrite_social_url("@elonmusk") == "@elonmusk"
     assert rewrite_social_url("x:keyword:foo") == "x:keyword:foo"
-    assert rewrite_social_url("reddit:r/PokemonTCG") == "reddit:r/PokemonTCG"
     assert rewrite_social_url("keyword:機動戰士 domain[gundam]") == "keyword:機動戰士 domain[gundam]"
